@@ -4,7 +4,7 @@ Full whole-body teleoperation using PICO VR headset and controllers. To teleop, 
 
 ```{admonition} Safety Warning
 :class: danger
-Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, or **A+B+X+Y** on the PICO controllers).
+Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, **`a`** in the PICO manager terminal, or **A+B+X+Y** on the PICO controllers).
 
 You **must wear tight-fitting pants or leggings** to guarantee line-of-sight for the foot trackers — loose or baggy clothing can make tracking fail unpredictably and may result in dangerous motion.
 ```
@@ -66,15 +66,39 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager \
 # python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
 
+If you are using a vendored Fourier FDH-6 hand setup driven directly from XR
+hand tracking, launch the same streamer with:
+
+```bash
+source .venv_teleop/bin/activate
+pip install pybind11
+pip install dexhandpy
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
+```
+
+`pybind11` and `dexhandpy` are required only for the Fourier hand path. If you
+are using standard PICO whole-body teleoperation without Fourier hands, you can
+skip those two installs.
+
+Optional debugging flags:
+
+```bash
+# Print landmark-distance / 6-DoF action summaries
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_debug
+
+# Validate the full pipeline without sending Fourier SDK commands
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_sim
+```
+
 When you turn on the visualization, wait for a window to pop up showing a Unitree G1 mesh with all joints at the default angles. If no window shows up, double-check the PICO's XRoboToolKit IP configuration in the [VR Teleop Setup](../getting_started/vr_teleop_setup.md).
 
 ### Your First Teleop Session
 
 1. **Assume the calibration pose** — stand upright, feet together, upper arms at your sides, forearms bent 90° forward (L-shape at each elbow), palms inward. See [Calibration Pose](#calibration-pose) for details.
-2. Press **A + B + X + Y** simultaneously to engage the control policy and run the initial full calibration (`CALIB_FULL`).
-3. Align your arms with the robot's current pose, then press **A + X** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
-4. Press **A + X** again to fall back to **PLANNER** (idle) mode.
-5. Press **A + B + X + Y** again to stop the robot.
+2. Press **A + B + X + Y** or keyboard **`a`** to engage the control policy and run the initial full calibration (`CALIB_FULL`).
+3. Align your arms with the robot's current pose, then press **A + X** or keyboard **`b`** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
+4. Press **A + X** or keyboard **`b`** again to fall back to **PLANNER** (idle) mode.
+5. Press **A + B + X + Y** or keyboard **`a`** again to stop the robot.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -91,17 +115,18 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 
 ### Modes & Calibration
 
-The system has **4 operating modes** and **2 calibration types**.
+The teleop manager uses **6 runtime states** and **2 calibration types**.
 
 **Modes:**
 
 | Mode | Encoder | Description |
 |---|---|---|
-| **OFF** | -- | Policy not running. Stand in [calibration pose](#calibration-pose), then press **A+B+X+Y** to start policy. |
-| **POSE** | SMPL | Whole-body teleop — streaming the SMPL pose from PICO to the C++ deployment side. Your motion will directly map to the robot .|
+| **OFF** | -- | Policy not running. Stand in [calibration pose](#calibration-pose), then press **A+B+X+Y** or keyboard **`a`** to start policy. |
+| **POSE** | SMPL | Whole-body teleop — streaming the SMPL pose from PICO to the C++ deployment side. Your motion maps directly to the robot. |
 | **PLANNER** | G1 | Locomotion planner active; upper body controller by planner. Joysticks control direction and heading in walking and running modes. |
 | **PLANNER_FROZEN_UPPER** | G1 | Planner locomotion; upper body frozen at last POSE snapshot. |
 | **VR_3PT** | TELEOP | Planner locomotion; upper body follows VR 3-point tracking (head + 2 hands). Depends on non-IK-based VR 3-point calibration. |
+| **POSE_PAUSE** | SMPL | Temporary pause entered by holding the **left menu** button while in `POSE`; release the button to resume `POSE`. |
 
 **Calibration types** (non-IK workflow for minimal latency):
 
@@ -112,7 +137,7 @@ The system has **4 operating modes** and **2 calibration types**.
 
 ### State Machine
 
-There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or **B+Y**) returns to POSE from *both* the planner node and its VR_3PT sub-mode.
+The main teleop flow has 5 user-facing modes (`OFF`, `POSE`, `PLANNER`, `PLANNER_FROZEN_UPPER`, `VR_3PT`) plus a transient `POSE_PAUSE` state. Each chain forms a triangle: **A+X** (or **B+Y**) returns to `POSE` from both the planner node and its `VR_3PT` sub-mode.
 
 ```text
   ┌──────────────────────────────────────┐
@@ -209,11 +234,13 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 
 | Action | Button | Notes |
 |---|---|---|
-| **Start / Stop policy** | **A+B+X+Y** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. |
-| **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
+| **Start / Stop policy** | **A+B+X+Y** or keyboard **`a`** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. Keyboard `a` is handled by the `pico_manager_thread_server.py` terminal. |
+| **Toggle POSE** | **A+X** or keyboard **`b`** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. Keyboard `b` is handled by the `pico_manager_thread_server.py` terminal. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
-| **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
+| **Pause POSE** | **Hold Left Menu** | Enters `POSE_PAUSE` while the button is held; releasing it returns to `POSE`. |
+| **Hand grasp** | **Trigger** (per hand) | Legacy `--hand_mode trigger` only. |
+| **Fourier hand control** | **XR hand tracking** | In `--hand_mode fourier`, the FDH-6 hands are driven directly from XR hand landmarks instead of controller triggers. |
 
 ### Joystick Controls (Planner Modes)
 
@@ -251,6 +278,7 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 | Method | Action |
 |---|---|
 | **PICO controllers** | Press **A+B+X+Y** simultaneously → OFF |
+| **Manager terminal** | Press keyboard **`a`** in the `pico_manager_thread_server.py` terminal → OFF |
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 
 ---
@@ -296,8 +324,28 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 #   --vis_vr3pt --vis_smpl
 ```
 
+If you are using Fourier FDH-6 hands on the real robot, start the same
+manager with:
+
+```bash
+source .venv_teleop/bin/activate
+pip install pybind11
+pip install dexhandpy
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
+```
+
+For Fourier hand debugging or dry-run validation:
+
+```bash
+# Print periodic XR landmark / 6-DoF summaries
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_debug
+
+# Keep the full pipeline active without sending dexhand SDK commands
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_sim
+```
+
 ```{note}
 Update the IP in the PICO's XRoboToolKit app to match this machine before starting.
 ```
 
-Follow the same start sequence: calibration pose → **A+B+X+Y** → **A+X** for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.
+Follow the same start sequence: calibration pose → **A+B+X+Y** or keyboard **`a`** → **A+X** or keyboard **`b`** for `POSE` mode. See [Complete PICO Controls](#pico-controls) for all available commands.

@@ -13,12 +13,8 @@
     python pico_manager_thread_server.py --manager --vis_vr3pt
 
     # Fourier dexterous hand control from XR hand tracking.
-    # openxr_arm_frame matches xr_teleoperate's world -> arm frame hand pipeline and is the
-    # recommended mode for Fourier. wrist_local is kept only for A/B debugging.
     python pico_manager_thread_server.py --manager \
-        --hand_mode fourier \
-        --fourier_coord_mode openxr_arm_frame \
-        --xr_teleop_root /path/to/xr_teleoperate
+        --hand_mode fourier
 
 # DEBUG VR3 PT VISUALIZATION:
     # A standalone test mode that captures one live frame and visualizes it.
@@ -33,14 +29,24 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import inspect
-from multiprocessing import Array, Lock
 import os
 from pathlib import Path
-import types
+import select
 import subprocess
 import sys
 import threading
 import time
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import msgpack
 import numpy as np
@@ -197,6 +203,77 @@ T_TO_UNITREE_HAND = np.array(
 )
 T_TO_UNITREE_HAND_ROT = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
 FOURIER_ZERO_ACTION = np.zeros(6, dtype=np.float32)
+
+
+class KeyboardHotkeyBridge:
+    """Background terminal hotkeys for manager control without extra dependencies."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending = {"a": 0, "b": 0}
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._stdin_fd = None
+        self._old_termios = None
+        self.enabled = False
+
+        if termios is None or tty is None:
+            print("[KeyboardHotkeys] Disabled: termios/tty unavailable")
+            return
+        if not sys.stdin or not sys.stdin.isatty():
+            print("[KeyboardHotkeys] Disabled: stdin is not a TTY")
+            return
+
+        try:
+            self._stdin_fd = sys.stdin.fileno()
+            self._old_termios = termios.tcgetattr(self._stdin_fd)
+            tty.setcbreak(self._stdin_fd)
+            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._thread.start()
+            self.enabled = True
+        except Exception as exc:
+            print(f"[KeyboardHotkeys] Disabled: {exc}")
+            self.close()
+
+    def _reader_loop(self) -> None:
+        assert self._stdin_fd is not None
+        while not self._stop_event.is_set():
+            try:
+                ready, _, _ = select.select([self._stdin_fd], [], [], 0.05)
+                if not ready:
+                    continue
+                chars = os.read(self._stdin_fd, 32)
+                if not chars:
+                    continue
+                with self._lock:
+                    for ch in chars.decode("utf-8", errors="ignore").lower():
+                        if ch in self._pending:
+                            self._pending[ch] += 1
+            except Exception:
+                break
+
+    def consume(self, key: str) -> bool:
+        """Return True once per queued keypress event."""
+        normalized = key.lower()
+        with self._lock:
+            count = self._pending.get(normalized, 0)
+            if count <= 0:
+                return False
+            self._pending[normalized] = count - 1
+            return True
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.2)
+        if self._stdin_fd is not None and self._old_termios is not None:
+            try:
+                termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._old_termios)
+            except Exception:
+                pass
+        self._thread = None
+        self._stdin_fd = None
+        self._old_termios = None
 
 
 def _compute_rel_transform(pose, world_frame, scalar_first=True):
@@ -639,204 +716,16 @@ def init_hand_ik_solvers():
     return None, None
 
 
-class FourierHandDriverCompat:
-    """Compatibility wrapper for Fourier drivers with slightly different APIs."""
-
-    def __init__(self, impl):
-        self.impl = impl
-
-    @staticmethod
-    def _write_landmarks(shared, landmarks: np.ndarray | None) -> None:
-        if shared is None:
-            return
-        data = (
-            np.asarray(landmarks, dtype=np.float64).reshape(25, 3)
-            if landmarks is not None
-            else np.zeros((25, 3), dtype=np.float64)
-        )
-        with shared.get_lock():
-            shared[:] = data.reshape(-1)
-
-    def update_landmarks(
-        self,
-        left_landmarks: np.ndarray | None,
-        right_landmarks: np.ndarray | None,
-    ) -> None:
-        if hasattr(self.impl, "update_landmarks"):
-            self.impl.update_landmarks(left_landmarks, right_landmarks)
-            return
-
-        left_shared = getattr(self.impl, "left_hand_pos_array", None)
-        right_shared = getattr(self.impl, "right_hand_pos_array", None)
-        if left_shared is not None or right_shared is not None:
-            self._write_landmarks(left_shared, left_landmarks)
-            self._write_landmarks(right_shared, right_landmarks)
-            return
-
-        raise AttributeError(
-            f"Fourier driver {type(self.impl).__name__} does not expose update_landmarks "
-            "or shared landmark buffers"
-        )
-
-    def get_latest_action(self) -> tuple[np.ndarray, np.ndarray]:
-        if hasattr(self.impl, "get_latest_action"):
-            return self.impl.get_latest_action()
-
-        action_array = getattr(self.impl, "dual_hand_action_array", None)
-        if action_array is not None:
-            action = np.asarray(action_array[:], dtype=np.float32)
-            if action.size >= 12:
-                return action[:6].copy(), action[6:12].copy()
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-
-    def close(self) -> None:
-        close_fn = getattr(self.impl, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-
-class LocalFourierHandDriver:
-    """Local fallback driver that directly wraps xr_teleoperate's Fourier_Controller."""
-
-    DEFAULT_XR_TELEOP_ROOT = Path("/home/wsy/ygx/4.3/xr_teleoperate")
-
-    @staticmethod
-    def _ensure_logging_mp_stub() -> None:
-        if "logging_mp" in sys.modules:
-            return
-
-        import logging
-
-        stub = types.ModuleType("logging_mp")
-        stub.DEBUG = logging.DEBUG
-        stub.INFO = logging.INFO
-        stub.WARNING = logging.WARNING
-        stub.ERROR = logging.ERROR
-        stub.CRITICAL = logging.CRITICAL
-        stub.basic_config = logging.basicConfig
-        stub.basicConfig = logging.basicConfig
-        stub.get_logger = logging.getLogger
-        sys.modules["logging_mp"] = stub
-
-    def __init__(
-        self,
-        xr_teleop_root: str | None = None,
-        simulation_mode: bool = False,
-    ) -> None:
-        root = (
-            Path(xr_teleop_root).expanduser().resolve()
-            if xr_teleop_root
-            else Path(os.environ.get("GROOT_XR_TELEOP_ROOT", self.DEFAULT_XR_TELEOP_ROOT))
-            .expanduser()
-            .resolve()
-        )
-        if not root.exists():
-            raise FileNotFoundError(
-                f"XR teleoperate repo not found: {root}. "
-                "Set --xr_teleop_root or GROOT_XR_TELEOP_ROOT."
-            )
-
-        extra_paths = [
-            str(root),
-            str(root / "teleop" / "robot_control" / "dex-retargeting" / "src"),
-        ]
-        for path in extra_paths:
-            if path not in sys.path:
-                sys.path.insert(0, path)
-        self._ensure_logging_mp_stub()
-
-        cwd = os.getcwd()
-        try:
-            os.chdir(root / "teleop")
-            from teleop.robot_control.robot_hand_fourier import Fourier_Controller
-
-            self.left_hand_pos_array = Array("d", 75, lock=True)
-            self.right_hand_pos_array = Array("d", 75, lock=True)
-            self.dual_hand_data_lock = Lock()
-            self.dual_hand_state_array = Array("d", 12, lock=False)
-            self.dual_hand_action_array = Array("d", 12, lock=False)
-
-            self._controller = Fourier_Controller(
-                self.left_hand_pos_array,
-                self.right_hand_pos_array,
-                self.dual_hand_data_lock,
-                self.dual_hand_state_array,
-                self.dual_hand_action_array,
-                simulation_mode=simulation_mode,
-            )
-        finally:
-            os.chdir(cwd)
-
-    def update_landmarks(
-        self,
-        left_landmarks: np.ndarray | None,
-        right_landmarks: np.ndarray | None,
-    ) -> None:
-        left = (
-            np.asarray(left_landmarks, dtype=np.float64).reshape(25, 3)
-            if left_landmarks is not None
-            else np.zeros((25, 3), dtype=np.float64)
-        )
-        right = (
-            np.asarray(right_landmarks, dtype=np.float64).reshape(25, 3)
-            if right_landmarks is not None
-            else np.zeros((25, 3), dtype=np.float64)
-        )
-        with self.left_hand_pos_array.get_lock():
-            self.left_hand_pos_array[:] = left.reshape(-1)
-        with self.right_hand_pos_array.get_lock():
-            self.right_hand_pos_array[:] = right.reshape(-1)
-
-    def get_latest_action(self) -> tuple[np.ndarray, np.ndarray]:
-        action = np.asarray(self.dual_hand_action_array[:], dtype=np.float32)
-        if action.size < 12:
-            return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-        return action[:6].copy(), action[6:12].copy()
-
-    def close(self) -> None:
-        return None
-
-
 def init_fourier_hand_driver(
     hand_mode: str,
-    xr_teleop_root: str | None = None,
     fourier_simulation_mode: bool = False,
 ):
     """Initialize the optional Fourier hand driver."""
     if hand_mode != "fourier":
         return None
-
-    driver = None
-    if FourierHandDriver is not None:
-        init_sig = inspect.signature(FourierHandDriver.__init__)
-        params = list(init_sig.parameters.keys())
-        kwargs = {}
-        if "xr_teleop_root" in params:
-            kwargs["xr_teleop_root"] = xr_teleop_root
-        elif xr_teleop_root:
-            os.environ["GROOT_XR_TELEOP_ROOT"] = xr_teleop_root
-
-        if "simulation_mode" in params:
-            kwargs["simulation_mode"] = fourier_simulation_mode
-
-        try:
-            driver = FourierHandDriver(**kwargs)
-        except TypeError:
-            # Fallback for stale environments that expose an older constructor.
-            if "simulation_mode" in params:
-                driver = FourierHandDriver(fourier_simulation_mode)
-            else:
-                driver = FourierHandDriver()
-
-    if driver is None or not (
-        hasattr(driver, "update_landmarks") or hasattr(driver, "left_hand_pos_array")
-    ):
-        driver = LocalFourierHandDriver(
-            xr_teleop_root=xr_teleop_root,
-            simulation_mode=fourier_simulation_mode,
-        )
-
-    return FourierHandDriverCompat(driver)
+    if FourierHandDriver is None:
+        raise ImportError("FourierHandDriver unavailable but hand_mode='fourier' was requested.")
+    return FourierHandDriver(simulation_mode=fourier_simulation_mode)
 
 
 def get_controller_inputs():
@@ -1224,7 +1113,6 @@ def _pose_stream_common(
     hand_mode: str = "trigger",
     fourier_coord_mode: str = "openxr_arm_frame",
     fourier_debug: bool = False,
-    xr_teleop_root: str | None = None,
     fourier_simulation_mode: bool = False,
 ):
     """Shared pose streaming loop used by run_pico."""
@@ -1247,7 +1135,6 @@ def _pose_stream_common(
     )
     fourier_hand_driver = init_fourier_hand_driver(
         hand_mode=hand_mode,
-        xr_teleop_root=xr_teleop_root,
         fourier_simulation_mode=fourier_simulation_mode,
     )
     if hand_mode == "fourier":
@@ -1268,7 +1155,6 @@ def _pose_stream_common(
         hand_mode=hand_mode,
         fourier_coord_mode=fourier_coord_mode,
         fourier_debug=fourier_debug,
-        xr_teleop_root=xr_teleop_root,
         fourier_simulation_mode=fourier_simulation_mode,
         fourier_hand_driver=fourier_hand_driver,
         log_prefix=log_prefix,
@@ -1602,7 +1488,6 @@ class PoseStreamer:
         hand_mode: str = "trigger",
         fourier_coord_mode: str = "openxr_arm_frame",
         fourier_debug: bool = False,
-        xr_teleop_root: str | None = None,
         fourier_simulation_mode: bool = False,
         fourier_hand_driver=None,
         log_prefix: str = "PoseLoop",
@@ -1631,7 +1516,6 @@ class PoseStreamer:
         self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
         self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
             hand_mode=hand_mode,
-            xr_teleop_root=xr_teleop_root,
             fourier_simulation_mode=fourier_simulation_mode,
         )
         if hand_mode == "trigger":
@@ -1968,7 +1852,6 @@ def run_pico(
     hand_mode: str = "trigger",
     fourier_coord_mode: str = "openxr_arm_frame",
     fourier_debug: bool = False,
-    xr_teleop_root: str | None = None,
     fourier_simulation_mode: bool = False,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
@@ -2011,7 +1894,6 @@ def run_pico(
             hand_mode=hand_mode,
             fourier_coord_mode=fourier_coord_mode,
             fourier_debug=fourier_debug,
-            xr_teleop_root=xr_teleop_root,
             fourier_simulation_mode=fourier_simulation_mode,
         )
     finally:
@@ -2099,7 +1981,6 @@ class PlannerStreamer:
         hand_mode: str = "trigger",
         fourier_coord_mode: str = "openxr_arm_frame",
         fourier_debug: bool = False,
-        xr_teleop_root: str | None = None,
         fourier_simulation_mode: bool = False,
         fourier_hand_driver=None,
     ):
@@ -2125,7 +2006,6 @@ class PlannerStreamer:
         self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
         self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
             hand_mode=hand_mode,
-            xr_teleop_root=xr_teleop_root,
             fourier_simulation_mode=fourier_simulation_mode,
         )
         if hand_mode == "trigger":
@@ -2327,7 +2207,6 @@ def run_pico_manager(
     hand_mode: str = "trigger",
     fourier_coord_mode: str = "openxr_arm_frame",
     fourier_debug: bool = False,
-    xr_teleop_root: str | None = None,
     fourier_simulation_mode: bool = False,
 ):
     """
@@ -2335,6 +2214,8 @@ def run_pico_manager(
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
+      Keyboard a: Equivalent to A+B+X+Y
+      Keyboard b: Equivalent to A+X
     """
     if xrt is None:
         raise ImportError(
@@ -2372,9 +2253,9 @@ def run_pico_manager(
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
     )
+    keyboard_hotkeys = KeyboardHotkeyBridge()
     fourier_hand_driver = init_fourier_hand_driver(
         hand_mode=hand_mode,
-        xr_teleop_root=xr_teleop_root,
         fourier_simulation_mode=fourier_simulation_mode,
     )
     if hand_mode == "fourier":
@@ -2395,7 +2276,6 @@ def run_pico_manager(
         hand_mode=hand_mode,
         fourier_coord_mode=fourier_coord_mode,
         fourier_debug=fourier_debug,
-        xr_teleop_root=xr_teleop_root,
         fourier_simulation_mode=fourier_simulation_mode,
         fourier_hand_driver=fourier_hand_driver,
         log_prefix="PoseLoop",
@@ -2410,7 +2290,6 @@ def run_pico_manager(
         hand_mode=hand_mode,
         fourier_coord_mode=fourier_coord_mode,
         fourier_debug=fourier_debug,
-        xr_teleop_root=xr_teleop_root,
         fourier_simulation_mode=fourier_simulation_mode,
         fourier_hand_driver=fourier_hand_driver,
     )
@@ -2430,7 +2309,9 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print("Manager controls: A+X=toggle mode, B+Y=toggle frozen upper body, "
+          "left stick click=toggle VR3PT, left menu hold=pause pose, "
+          "A+B+X+Y=start/stop policy, keyboard a=start/stop policy, keyboard b=toggle mode")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2451,17 +2332,19 @@ def run_pico_manager(
             left_axis_click, _ = get_axis_clicks()
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
+            keyboard_ax_pressed = keyboard_hotkeys.consume("b") if keyboard_hotkeys is not None else False
             ax_pressed = (a_pressed) and (x_pressed)
 
             # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+            keyboard_start_combo = keyboard_hotkeys.consume("a") if keyboard_hotkeys is not None else False
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
@@ -2473,17 +2356,17 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
@@ -2492,7 +2375,7 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.OFF
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
@@ -2500,7 +2383,7 @@ def run_pico_manager(
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.OFF
                 elif not left_menu_button:
                     new_mode = StreamMode.POSE
@@ -2510,11 +2393,11 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
+                if keyboard_start_combo or (start_combo and not prev_start_combo):
                     new_mode = StreamMode.OFF
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
+                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
@@ -2604,6 +2487,7 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        keyboard_hotkeys.close()
         if fourier_hand_driver is not None:
             close_fn = getattr(fourier_hand_driver, "close", None)
             if callable(close_fn):
@@ -2647,22 +2531,9 @@ if __name__ == "__main__":
         help="Hand control mode: legacy trigger/grip or XR hand tracking -> Fourier SDK",
     )
     parser.add_argument(
-        "--fourier_coord_mode",
-        type=str,
-        choices=["openxr_arm_frame", "wrist_local"],
-        default="openxr_arm_frame",
-        help="Coordinate conversion used before Fourier DexPilot retargeting",
-    )
-    parser.add_argument(
         "--fourier_debug",
         action="store_true",
         help="Log periodic Fourier landmark distances and 6-DoF actions for debugging",
-    )
-    parser.add_argument(
-        "--xr_teleop_root",
-        type=str,
-        default=None,
-        help="Path to the xr_teleoperate repo used by Fourier hand control",
     )
     parser.add_argument(
         "--fourier_sim",
@@ -2768,9 +2639,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             hand_mode=args.hand_mode,
-            fourier_coord_mode=args.fourier_coord_mode,
             fourier_debug=args.fourier_debug,
-            xr_teleop_root=args.xr_teleop_root,
             fourier_simulation_mode=args.fourier_sim,
         )
     else:
@@ -2788,8 +2657,6 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             hand_mode=args.hand_mode,
-            fourier_coord_mode=args.fourier_coord_mode,
             fourier_debug=args.fourier_debug,
-            xr_teleop_root=args.xr_teleop_root,
             fourier_simulation_mode=args.fourier_sim,
         )

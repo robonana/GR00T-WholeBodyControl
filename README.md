@@ -114,6 +114,45 @@ SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling 
 </table>
 </div>
 
+### Teleop quick start
+
+For a full setup walkthrough, see the
+[VR Teleop Setup](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/vr_teleop_setup.html)
+and
+[VR Whole-Body Teleop tutorial](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vr_wholebody_teleop.html).
+
+Typical simulation teleop uses three terminals:
+
+```bash
+# Terminal 1: MuJoCo simulator
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+
+# Terminal 2: C++ deployment bridge
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager sim
+
+# Terminal 3: PICO teleop manager
+cd ..
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --manager
+```
+
+For Fourier FDH-6 hands driven directly from XR hand tracking:
+
+```bash
+source .venv_teleop/bin/activate
+pip install pybind11
+pip install dexhandpy
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
+```
+
+Keyboard fallbacks in the `pico_manager_thread_server.py` terminal:
+
+- `a` = `A+B+X+Y` (start/stop policy)
+- `b` = `A+X` (toggle `PLANNER` / `POSE`)
+
 ## Kinematic Planner
 
 SONIC includes a kinematic planner for real-time locomotion generation — choose a movement style, steer with keyboard/gamepad, and adjust speed and height on the fly.

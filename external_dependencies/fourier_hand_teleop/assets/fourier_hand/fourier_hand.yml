@@ -1,0 +1,47 @@
+left:
+  type: dexpilot # DexPilot for Fourier 6DoF hand (15 vectors: 10 inter-finger + 5 palm-to-tip)
+  urdf_path: fourier_hand/urdf/fourier_left_hand_6dof.urdf
+
+  # Target refers to the retargeting target, which is the robot hand
+  target_joint_names:
+    [
+      'L_thumb_proximal_yaw_joint',
+      'L_thumb_proximal_pitch_joint',
+      'L_index_proximal_joint',
+      'L_middle_proximal_joint',
+      'L_ring_proximal_joint',
+      'L_pinky_proximal_joint'
+    ]
+
+  # for DexPilot type
+  wrist_link_name: "L_hand_base_link"
+  finger_tip_link_names: [ "L_thumb_tip_link", "L_index_tip_link", "L_middle_tip_link", "L_ring_tip_link", "L_pinky_tip_link" ]
+
+  # Scaling factor: robot_size / human_size ≈ 0.137 / 0.18 ≈ 0.76
+  scaling_factor: 1.3
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
+  low_pass_alpha: 0.2
+
+right:
+  type: dexpilot # DexPilot for Fourier 6DoF hand (15 vectors: 10 inter-finger + 5 palm-to-tip)
+  urdf_path: fourier_hand/urdf/fourier_right_hand_6dof.urdf
+
+  # Target refers to the retargeting target, which is the robot hand
+  target_joint_names:
+    [
+      'R_thumb_proximal_yaw_joint',
+      'R_thumb_proximal_pitch_joint',
+      'R_index_proximal_joint',
+      'R_middle_proximal_joint',
+      'R_ring_proximal_joint',
+      'R_pinky_proximal_joint'
+    ]
+
+  # for DexPilot type
+  wrist_link_name: "R_hand_base_link"
+  finger_tip_link_names: [ "R_thumb_tip_link", "R_index_tip_link", "R_middle_tip_link", "R_ring_tip_link", "R_pinky_tip_link" ]
+
+  # Scaling factor: robot_size / human_size ≈ 0.137 / 0.18 ≈ 0.76
+  scaling_factor: 1.3
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
+  low_pass_alpha: 0.2
