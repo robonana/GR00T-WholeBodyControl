@@ -404,6 +404,12 @@ class GrootDataCollector:
             "vr_3pt_orientation": vr_3pt_orientation,
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
+            "left_hand_fourier_joints": self._extract_optional_vector(
+                data, "left_hand_fourier_joints", 6
+            ),
+            "right_hand_fourier_joints": self._extract_optional_vector(
+                data, "right_hand_fourier_joints", 6
+            ),
             "receive_timestamp": time.time(),
         }
 
@@ -478,6 +484,12 @@ class GrootDataCollector:
                 ),
                 "left_hand_joints": left_hand_joints,
                 "right_hand_joints": right_hand_joints,
+                "left_hand_fourier_joints": self._extract_optional_vector(
+                    pose_data, "left_hand_fourier_joints", 6
+                ),
+                "right_hand_fourier_joints": self._extract_optional_vector(
+                    pose_data, "right_hand_fourier_joints", 6
+                ),
                 "left_wrist_joints": left_wrist_joints,
                 "right_wrist_joints": right_wrist_joints,
                 "vr_3pt_position": vr_3pt_position,
@@ -500,6 +512,15 @@ class GrootDataCollector:
                 arr = arr[0]
             return arr.astype(np.float32)
         return np.zeros(7, dtype=np.float32)
+
+    @staticmethod
+    def _extract_optional_vector(pose_data: dict, key: str, size: int) -> np.ndarray:
+        arr = pose_data.get(key)
+        if arr is not None:
+            if arr.ndim > 1:
+                arr = arr[0]
+            return arr.astype(np.float32)
+        return np.zeros(size, dtype=np.float32)
 
     @staticmethod
     def _extract_bool(pose_data: dict, key: str) -> bool:

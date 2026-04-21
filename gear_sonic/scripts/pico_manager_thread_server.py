@@ -12,6 +12,14 @@
     # VR3 PT visualization only (without SMPL body) — lower latency
     python pico_manager_thread_server.py --manager --vis_vr3pt
 
+    # Fourier dexterous hand control from XR hand tracking.
+    # openxr_arm_frame matches xr_teleoperate's world -> arm frame hand pipeline and is the
+    # recommended mode for Fourier. wrist_local is kept only for A/B debugging.
+    python pico_manager_thread_server.py --manager \
+        --hand_mode fourier \
+        --fourier_coord_mode openxr_arm_frame \
+        --xr_teleop_root /path/to/xr_teleoperate
+
 # DEBUG VR3 PT VISUALIZATION:
     # A standalone test mode that captures one live frame and visualizes it.
     python pico_manager_thread_server.py --vr3pt_live
@@ -24,8 +32,13 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import inspect
+from multiprocessing import Array, Lock
 import os
+from pathlib import Path
+import types
 import subprocess
+import sys
 import threading
 import time
 
@@ -96,6 +109,12 @@ except ImportError:
     print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
 
+try:
+    from gear_sonic.utils.teleop.solver.hand.fourier_hand_driver import FourierHandDriver
+except ImportError:
+    print("Warning: FourierHandDriver not available.")
+    FourierHandDriver = None
+
 
 class LocomotionMode(IntEnum):
     """Locomotion mode enum for robot movement."""
@@ -164,6 +183,20 @@ OFFSETS = [
     ),  # R-Wrist: roll -90° about fixed X, then yaw 180° about fixed Z
     sRot.from_euler("xyz", [0, 0, -90], degrees=True),  # Neck: yaw -90° about fixed Z
 ]
+
+XR_HAND_JOINT_COUNT = 26
+UNITY_TO_ROBOT_ROT = np.array([[-1, 0, 0], [0, 0, 1], [0, 1, 0.0]], dtype=np.float32)
+T_ROBOT_OPENXR = np.array(
+    [[0, 0, -1, 0], [-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float32
+)
+T_OPENXR_ROBOT = np.array(
+    [[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float32
+)
+T_TO_UNITREE_HAND = np.array(
+    [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=np.float32
+)
+T_TO_UNITREE_HAND_ROT = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
+FOURIER_ZERO_ACTION = np.zeros(6, dtype=np.float32)
 
 
 def _compute_rel_transform(pose, world_frame, scalar_first=True):
@@ -606,6 +639,206 @@ def init_hand_ik_solvers():
     return None, None
 
 
+class FourierHandDriverCompat:
+    """Compatibility wrapper for Fourier drivers with slightly different APIs."""
+
+    def __init__(self, impl):
+        self.impl = impl
+
+    @staticmethod
+    def _write_landmarks(shared, landmarks: np.ndarray | None) -> None:
+        if shared is None:
+            return
+        data = (
+            np.asarray(landmarks, dtype=np.float64).reshape(25, 3)
+            if landmarks is not None
+            else np.zeros((25, 3), dtype=np.float64)
+        )
+        with shared.get_lock():
+            shared[:] = data.reshape(-1)
+
+    def update_landmarks(
+        self,
+        left_landmarks: np.ndarray | None,
+        right_landmarks: np.ndarray | None,
+    ) -> None:
+        if hasattr(self.impl, "update_landmarks"):
+            self.impl.update_landmarks(left_landmarks, right_landmarks)
+            return
+
+        left_shared = getattr(self.impl, "left_hand_pos_array", None)
+        right_shared = getattr(self.impl, "right_hand_pos_array", None)
+        if left_shared is not None or right_shared is not None:
+            self._write_landmarks(left_shared, left_landmarks)
+            self._write_landmarks(right_shared, right_landmarks)
+            return
+
+        raise AttributeError(
+            f"Fourier driver {type(self.impl).__name__} does not expose update_landmarks "
+            "or shared landmark buffers"
+        )
+
+    def get_latest_action(self) -> tuple[np.ndarray, np.ndarray]:
+        if hasattr(self.impl, "get_latest_action"):
+            return self.impl.get_latest_action()
+
+        action_array = getattr(self.impl, "dual_hand_action_array", None)
+        if action_array is not None:
+            action = np.asarray(action_array[:], dtype=np.float32)
+            if action.size >= 12:
+                return action[:6].copy(), action[6:12].copy()
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+
+    def close(self) -> None:
+        close_fn = getattr(self.impl, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+class LocalFourierHandDriver:
+    """Local fallback driver that directly wraps xr_teleoperate's Fourier_Controller."""
+
+    DEFAULT_XR_TELEOP_ROOT = Path("/home/wsy/ygx/4.3/xr_teleoperate")
+
+    @staticmethod
+    def _ensure_logging_mp_stub() -> None:
+        if "logging_mp" in sys.modules:
+            return
+
+        import logging
+
+        stub = types.ModuleType("logging_mp")
+        stub.DEBUG = logging.DEBUG
+        stub.INFO = logging.INFO
+        stub.WARNING = logging.WARNING
+        stub.ERROR = logging.ERROR
+        stub.CRITICAL = logging.CRITICAL
+        stub.basic_config = logging.basicConfig
+        stub.basicConfig = logging.basicConfig
+        stub.get_logger = logging.getLogger
+        sys.modules["logging_mp"] = stub
+
+    def __init__(
+        self,
+        xr_teleop_root: str | None = None,
+        simulation_mode: bool = False,
+    ) -> None:
+        root = (
+            Path(xr_teleop_root).expanduser().resolve()
+            if xr_teleop_root
+            else Path(os.environ.get("GROOT_XR_TELEOP_ROOT", self.DEFAULT_XR_TELEOP_ROOT))
+            .expanduser()
+            .resolve()
+        )
+        if not root.exists():
+            raise FileNotFoundError(
+                f"XR teleoperate repo not found: {root}. "
+                "Set --xr_teleop_root or GROOT_XR_TELEOP_ROOT."
+            )
+
+        extra_paths = [
+            str(root),
+            str(root / "teleop" / "robot_control" / "dex-retargeting" / "src"),
+        ]
+        for path in extra_paths:
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        self._ensure_logging_mp_stub()
+
+        cwd = os.getcwd()
+        try:
+            os.chdir(root / "teleop")
+            from teleop.robot_control.robot_hand_fourier import Fourier_Controller
+
+            self.left_hand_pos_array = Array("d", 75, lock=True)
+            self.right_hand_pos_array = Array("d", 75, lock=True)
+            self.dual_hand_data_lock = Lock()
+            self.dual_hand_state_array = Array("d", 12, lock=False)
+            self.dual_hand_action_array = Array("d", 12, lock=False)
+
+            self._controller = Fourier_Controller(
+                self.left_hand_pos_array,
+                self.right_hand_pos_array,
+                self.dual_hand_data_lock,
+                self.dual_hand_state_array,
+                self.dual_hand_action_array,
+                simulation_mode=simulation_mode,
+            )
+        finally:
+            os.chdir(cwd)
+
+    def update_landmarks(
+        self,
+        left_landmarks: np.ndarray | None,
+        right_landmarks: np.ndarray | None,
+    ) -> None:
+        left = (
+            np.asarray(left_landmarks, dtype=np.float64).reshape(25, 3)
+            if left_landmarks is not None
+            else np.zeros((25, 3), dtype=np.float64)
+        )
+        right = (
+            np.asarray(right_landmarks, dtype=np.float64).reshape(25, 3)
+            if right_landmarks is not None
+            else np.zeros((25, 3), dtype=np.float64)
+        )
+        with self.left_hand_pos_array.get_lock():
+            self.left_hand_pos_array[:] = left.reshape(-1)
+        with self.right_hand_pos_array.get_lock():
+            self.right_hand_pos_array[:] = right.reshape(-1)
+
+    def get_latest_action(self) -> tuple[np.ndarray, np.ndarray]:
+        action = np.asarray(self.dual_hand_action_array[:], dtype=np.float32)
+        if action.size < 12:
+            return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+        return action[:6].copy(), action[6:12].copy()
+
+    def close(self) -> None:
+        return None
+
+
+def init_fourier_hand_driver(
+    hand_mode: str,
+    xr_teleop_root: str | None = None,
+    fourier_simulation_mode: bool = False,
+):
+    """Initialize the optional Fourier hand driver."""
+    if hand_mode != "fourier":
+        return None
+
+    driver = None
+    if FourierHandDriver is not None:
+        init_sig = inspect.signature(FourierHandDriver.__init__)
+        params = list(init_sig.parameters.keys())
+        kwargs = {}
+        if "xr_teleop_root" in params:
+            kwargs["xr_teleop_root"] = xr_teleop_root
+        elif xr_teleop_root:
+            os.environ["GROOT_XR_TELEOP_ROOT"] = xr_teleop_root
+
+        if "simulation_mode" in params:
+            kwargs["simulation_mode"] = fourier_simulation_mode
+
+        try:
+            driver = FourierHandDriver(**kwargs)
+        except TypeError:
+            # Fallback for stale environments that expose an older constructor.
+            if "simulation_mode" in params:
+                driver = FourierHandDriver(fourier_simulation_mode)
+            else:
+                driver = FourierHandDriver()
+
+    if driver is None or not (
+        hasattr(driver, "update_landmarks") or hasattr(driver, "left_hand_pos_array")
+    ):
+        driver = LocalFourierHandDriver(
+            xr_teleop_root=xr_teleop_root,
+            simulation_mode=fourier_simulation_mode,
+        )
+
+    return FourierHandDriverCompat(driver)
+
+
 def get_controller_inputs():
     """Fetch controller button/trigger states from XRoboToolkit."""
     left_trigger = xrt.get_left_trigger()
@@ -614,6 +847,112 @@ def get_controller_inputs():
     right_grip = xrt.get_right_grip()
     left_menu_button = xrt.get_left_menu_button()
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
+
+
+def _hand_tracking_state_to_robot_poses(hand_tracking_state: np.ndarray) -> np.ndarray:
+    """Convert XR hand joint poses from Unity coordinates to robot coordinates."""
+    robot_poses = np.zeros((hand_tracking_state.shape[0], 7), dtype=np.float32)
+    for i in range(hand_tracking_state.shape[0]):
+        pose = hand_tracking_state[i]
+        robot_poses[i, :3] = UNITY_TO_ROBOT_ROT @ pose[:3]
+        rot = sRot.from_quat(pose[3:7]).as_matrix()
+        rel_rot = sRot.from_matrix(UNITY_TO_ROBOT_ROT @ rot @ UNITY_TO_ROBOT_ROT.T)
+        quat_xyzw = rel_rot.as_quat()
+        robot_poses[i, 3:] = np.array(
+            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]],
+            dtype=np.float32,
+        )
+    return robot_poses
+
+
+def _fast_mat_inv(mat: np.ndarray) -> np.ndarray:
+    inv = np.eye(4, dtype=np.float32)
+    inv[:3, :3] = mat[:3, :3].T
+    inv[:3, 3] = -mat[:3, :3].T @ mat[:3, 3]
+    return inv
+
+
+def _pose7_to_mat_openxr(pose: np.ndarray) -> np.ndarray:
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = sRot.from_quat(pose[3:7]).as_matrix().astype(np.float32)
+    mat[:3, 3] = pose[:3].astype(np.float32)
+    return mat
+
+
+def _hand_tracking_state_to_unitree_landmarks_wrist_local(
+    hand_tracking_state: np.ndarray,
+) -> np.ndarray:
+    """Convert 26 XR hand joints into wrist-local 25-point landmarks."""
+    if hand_tracking_state.shape != (XR_HAND_JOINT_COUNT, 7):
+        raise ValueError(
+            f"Expected hand tracking state shape {(XR_HAND_JOINT_COUNT, 7)}, got {hand_tracking_state.shape}"
+        )
+
+    # XR/OpenXR uses 26 joints with palm at index 0 and wrist at index 1.
+    # xr_teleoperate expects the 25-joint layout with wrist at index 0.
+    robot_poses = _hand_tracking_state_to_robot_poses(hand_tracking_state)
+    wrist_pose = robot_poses[1]
+    wrist_rot = sRot.from_quat(wrist_pose[[4, 5, 6, 3]])
+    local_positions = wrist_rot.inv().apply(robot_poses[1:, :3] - wrist_pose[:3])
+    return (local_positions @ T_TO_UNITREE_HAND_ROT.T).astype(np.float32)
+
+
+def _hand_tracking_state_to_unitree_landmarks_openxr_arm_frame(
+    hand_tracking_state: np.ndarray,
+) -> np.ndarray:
+    """Match xr_teleoperate's OpenXR -> robot basis -> arm frame -> Unitree hand chain."""
+    if hand_tracking_state.shape != (XR_HAND_JOINT_COUNT, 7):
+        raise ValueError(
+            f"Expected hand tracking state shape {(XR_HAND_JOINT_COUNT, 7)}, got {hand_tracking_state.shape}"
+        )
+
+    # OpenXR 26 joints: palm + wrist + 24 finger joints.
+    hand_positions_openxr = hand_tracking_state[1:, :3].astype(np.float32)
+    hand_positions_openxr_h = np.concatenate(
+        [hand_positions_openxr.T, np.ones((1, hand_positions_openxr.shape[0]), dtype=np.float32)],
+        axis=0,
+    )
+    hand_positions_robot_world = T_ROBOT_OPENXR @ hand_positions_openxr_h
+
+    wrist_pose_openxr = _pose7_to_mat_openxr(hand_tracking_state[1])
+    wrist_pose_robot_world = T_ROBOT_OPENXR @ wrist_pose_openxr @ T_OPENXR_ROBOT
+
+    hand_positions_robot_arm = _fast_mat_inv(wrist_pose_robot_world) @ hand_positions_robot_world
+    return (T_TO_UNITREE_HAND @ hand_positions_robot_arm)[:3, :].T.astype(np.float32)
+
+
+def _hand_tracking_state_to_unitree_landmarks(
+    hand_tracking_state: np.ndarray,
+    coord_mode: str,
+) -> np.ndarray:
+    if coord_mode == "openxr_arm_frame":
+        return _hand_tracking_state_to_unitree_landmarks_openxr_arm_frame(hand_tracking_state)
+    if coord_mode == "wrist_local":
+        return _hand_tracking_state_to_unitree_landmarks_wrist_local(hand_tracking_state)
+    raise ValueError(f"Unknown Fourier coord mode: {coord_mode}")
+
+
+def get_hand_tracking_landmarks(coord_mode: str = "openxr_arm_frame"):
+    """Fetch left/right 25-point hand landmarks in the Unitree hand convention."""
+    if xrt is None:
+        return None, None, False, False
+
+    try:
+        left_active = bool(xrt.get_left_hand_is_active())
+        right_active = bool(xrt.get_right_hand_is_active())
+
+        left_landmarks = None
+        right_landmarks = None
+        if left_active:
+            left_state = np.asarray(xrt.get_left_hand_tracking_state(), dtype=np.float32)
+            left_landmarks = _hand_tracking_state_to_unitree_landmarks(left_state, coord_mode)
+        if right_active:
+            right_state = np.asarray(xrt.get_right_hand_tracking_state(), dtype=np.float32)
+            right_landmarks = _hand_tracking_state_to_unitree_landmarks(right_state, coord_mode)
+        return left_landmarks, right_landmarks, left_active, right_active
+    except Exception as exc:
+        print(f"[HandTracking] failed to fetch landmarks: {exc}")
+        return None, None, False, False
 
 
 def get_controller_axes():
@@ -705,6 +1044,68 @@ def compute_hand_joints_from_inputs(
         left_hand_joints = np.zeros((1, 7), dtype=np.float32)
         right_hand_joints = np.zeros((1, 7), dtype=np.float32)
     return left_hand_joints, right_hand_joints
+
+
+def compute_fourier_hand_joints_from_tracking(
+    hand_driver,
+    coord_mode: str = "openxr_arm_frame",
+):
+    """Update the Fourier hand controller from XR hand tracking and return the latest 6-DoF targets."""
+    if hand_driver is None:
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy(), None, None
+
+    try:
+        left_landmarks, right_landmarks, _, _ = get_hand_tracking_landmarks(coord_mode)
+        hand_driver.update_landmarks(left_landmarks, right_landmarks)
+        left_action, right_action = hand_driver.get_latest_action()
+        return left_action, right_action, left_landmarks, right_landmarks
+    except Exception as exc:
+        print(f"[FourierHandDriver] tracking update failed: {exc}")
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy(), None, None
+
+
+class FourierHandDebug:
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._last_log = 0.0
+
+    def maybe_log(
+        self,
+        coord_mode: str,
+        left_landmarks: np.ndarray | None,
+        right_landmarks: np.ndarray | None,
+        left_action: np.ndarray,
+        right_action: np.ndarray,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self._last_log < 2.0:
+            return
+        self._last_log = now
+
+        def _tip_distance(hand: np.ndarray | None, a: int, b: int) -> float:
+            if hand is None or hand.shape[0] <= max(a, b):
+                return float("nan")
+            return float(np.linalg.norm(hand[a] - hand[b]))
+
+        print(
+            "[FourierDebug] "
+            f"coord_mode={coord_mode} "
+            f"L(thumb-index={_tip_distance(left_landmarks, 4, 9):.4f}, "
+            f"thumb-middle={_tip_distance(left_landmarks, 4, 14):.4f}, "
+            f"action={np.round(left_action, 4).tolist()}) "
+            f"R(thumb-index={_tip_distance(right_landmarks, 4, 9):.4f}, "
+            f"thumb-middle={_tip_distance(right_landmarks, 4, 14):.4f}, "
+            f"action={np.round(right_action, 4).tolist()})"
+        )
+
+
+def build_planner_message_compat(**kwargs) -> bytes:
+    """Call build_planner_message while tolerating older installed signatures."""
+    sig = inspect.signature(build_planner_message)
+    supported = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return build_planner_message(**supported)
 
 
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -820,6 +1221,11 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_mode: str = "trigger",
+    fourier_coord_mode: str = "openxr_arm_frame",
+    fourier_debug: bool = False,
+    xr_teleop_root: str | None = None,
+    fourier_simulation_mode: bool = False,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -839,6 +1245,16 @@ def _pose_stream_common(
         enable_smpl_vis=enable_smpl_vis,
         log_prefix=log_prefix,
     )
+    fourier_hand_driver = init_fourier_hand_driver(
+        hand_mode=hand_mode,
+        xr_teleop_root=xr_teleop_root,
+        fourier_simulation_mode=fourier_simulation_mode,
+    )
+    if hand_mode == "fourier":
+        print(
+            f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
+            "(recommended: openxr_arm_frame)"
+        )
 
     streamer = PoseStreamer(
         socket=socket,
@@ -849,6 +1265,12 @@ def _pose_stream_common(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        hand_mode=hand_mode,
+        fourier_coord_mode=fourier_coord_mode,
+        fourier_debug=fourier_debug,
+        xr_teleop_root=xr_teleop_root,
+        fourier_simulation_mode=fourier_simulation_mode,
+        fourier_hand_driver=fourier_hand_driver,
         log_prefix=log_prefix,
     )
 
@@ -864,6 +1286,8 @@ def _pose_stream_common(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if fourier_hand_driver is not None:
+            fourier_hand_driver.close()
 
 
 class ThreePointPose:
@@ -1175,6 +1599,12 @@ class PoseStreamer:
         use_cuda: bool,
         record_dir: str,
         record_format: str,
+        hand_mode: str = "trigger",
+        fourier_coord_mode: str = "openxr_arm_frame",
+        fourier_debug: bool = False,
+        xr_teleop_root: str | None = None,
+        fourier_simulation_mode: bool = False,
+        fourier_hand_driver=None,
         log_prefix: str = "PoseLoop",
     ):
         self.socket = socket
@@ -1196,7 +1626,18 @@ class PoseStreamer:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
 
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_mode = hand_mode
+        self.fourier_coord_mode = fourier_coord_mode
+        self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
+        self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
+            hand_mode=hand_mode,
+            xr_teleop_root=xr_teleop_root,
+            fourier_simulation_mode=fourier_simulation_mode,
+        )
+        if hand_mode == "trigger":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
         self.parent_indices = [
             -1,
             0,
@@ -1293,14 +1734,32 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
-        )
+        if self.hand_mode == "fourier":
+            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            left_hand_fourier_joints, right_hand_fourier_joints, left_landmarks, right_landmarks = (
+                compute_fourier_hand_joints_from_tracking(
+                    self.fourier_hand_driver, self.fourier_coord_mode
+                )
+            )
+            self.fourier_debug.maybe_log(
+                self.fourier_coord_mode,
+                left_landmarks,
+                right_landmarks,
+                left_hand_fourier_joints,
+                right_hand_fourier_joints,
+            )
+        else:
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+                self.left_hand_ik_solver,
+                self.right_hand_ik_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
+            left_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
+            right_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1458,6 +1917,8 @@ class PoseStreamer:
                 ),
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
+                "left_hand_fourier_joints": left_hand_fourier_joints.astype(np.float32),
+                "right_hand_fourier_joints": right_hand_fourier_joints.astype(np.float32),
                 "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
                 "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
                 "heading_increment": np.array(
@@ -1504,6 +1965,11 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_mode: str = "trigger",
+    fourier_coord_mode: str = "openxr_arm_frame",
+    fourier_debug: bool = False,
+    xr_teleop_root: str | None = None,
+    fourier_simulation_mode: bool = False,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -1542,6 +2008,11 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            hand_mode=hand_mode,
+            fourier_coord_mode=fourier_coord_mode,
+            fourier_debug=fourier_debug,
+            xr_teleop_root=xr_teleop_root,
+            fourier_simulation_mode=fourier_simulation_mode,
         )
     finally:
         socket.close()
@@ -1625,6 +2096,12 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        hand_mode: str = "trigger",
+        fourier_coord_mode: str = "openxr_arm_frame",
+        fourier_debug: bool = False,
+        xr_teleop_root: str | None = None,
+        fourier_simulation_mode: bool = False,
+        fourier_hand_driver=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1643,8 +2120,18 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_mode = hand_mode
+        self.fourier_coord_mode = fourier_coord_mode
+        self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
+        self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
+            hand_mode=hand_mode,
+            xr_teleop_root=xr_teleop_root,
+            fourier_simulation_mode=fourier_simulation_mode,
+        )
+        if hand_mode == "trigger":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1735,6 +2222,8 @@ class PlannerStreamer:
             upper_body_position = None
             left_hand_position = None
             right_hand_position = None
+            left_hand_fourier_position = None
+            right_hand_fourier_position = None
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
                 left_hand_position = self.feedback_reader.left_hand_position_target
@@ -1751,35 +2240,56 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
-                )
-                left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
-                right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+                if self.hand_mode == "fourier":
+                    (
+                        lh_fourier,
+                        rh_fourier,
+                        left_landmarks,
+                        right_landmarks,
+                    ) = compute_fourier_hand_joints_from_tracking(
+                        self.fourier_hand_driver, self.fourier_coord_mode
+                    )
+                    self.fourier_debug.maybe_log(
+                        self.fourier_coord_mode,
+                        left_landmarks,
+                        right_landmarks,
+                        lh_fourier,
+                        rh_fourier,
+                    )
+                    left_hand_fourier_position = lh_fourier.astype(np.float32).tolist()
+                    right_hand_fourier_position = rh_fourier.astype(np.float32).tolist()
+                else:
+                    # Compute hand joints from trigger/grip inputs so operator can
+                    # control hand open/close while in VR 3PT mode
+                    (
+                        left_menu_button,
+                        left_trigger,
+                        right_trigger,
+                        left_grip,
+                        right_grip,
+                    ) = get_controller_inputs()
+                    lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                        self.left_hand_ik_solver,
+                        self.right_hand_ik_solver,
+                        left_trigger,
+                        left_grip,
+                        right_trigger,
+                        right_grip,
+                    )
+                    left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+                    right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
-            msg = build_planner_message(
-                mode_to_send.value,
-                movement,
-                facing,
+            msg = build_planner_message_compat(
+                mode=mode_to_send.value,
+                movement=movement,
+                facing=facing,
                 speed=speed,
                 height=-1.0,
                 upper_body_position=upper_body_position,
                 left_hand_position=left_hand_position,
                 right_hand_position=right_hand_position,
+                left_hand_fourier_position=left_hand_fourier_position,
+                right_hand_fourier_position=right_hand_fourier_position,
                 vr_3pt_position=vr_3pt_position,
                 vr_3pt_orientation=vr_3pt_orientation,
                 vr_3pt_compliance=vr_3pt_compliance,
@@ -1814,6 +2324,11 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_mode: str = "trigger",
+    fourier_coord_mode: str = "openxr_arm_frame",
+    fourier_debug: bool = False,
+    xr_teleop_root: str | None = None,
+    fourier_simulation_mode: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1857,6 +2372,16 @@ def run_pico_manager(
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
     )
+    fourier_hand_driver = init_fourier_hand_driver(
+        hand_mode=hand_mode,
+        xr_teleop_root=xr_teleop_root,
+        fourier_simulation_mode=fourier_simulation_mode,
+    )
+    if hand_mode == "fourier":
+        print(
+            f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
+            "(recommended: openxr_arm_frame)"
+        )
 
     pose_streamer = PoseStreamer(
         socket=socket,
@@ -1867,6 +2392,12 @@ def run_pico_manager(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        hand_mode=hand_mode,
+        fourier_coord_mode=fourier_coord_mode,
+        fourier_debug=fourier_debug,
+        xr_teleop_root=xr_teleop_root,
+        fourier_simulation_mode=fourier_simulation_mode,
+        fourier_hand_driver=fourier_hand_driver,
         log_prefix="PoseLoop",
     )
     planner_streamer = PlannerStreamer(
@@ -1876,6 +2407,12 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        hand_mode=hand_mode,
+        fourier_coord_mode=fourier_coord_mode,
+        fourier_debug=fourier_debug,
+        xr_teleop_root=xr_teleop_root,
+        fourier_simulation_mode=fourier_simulation_mode,
+        fourier_hand_driver=fourier_hand_driver,
     )
 
     # State machine diagram:
@@ -2067,6 +2604,10 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if fourier_hand_driver is not None:
+            close_fn = getattr(fourier_hand_driver, "close", None)
+            if callable(close_fn):
+                close_fn()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -2097,6 +2638,36 @@ if __name__ == "__main__":
         type=str,
         default="npz",
         help="Recording format: 'npz' or 'bin' (default: npz)",
+    )
+    parser.add_argument(
+        "--hand_mode",
+        type=str,
+        choices=["trigger", "fourier"],
+        default="trigger",
+        help="Hand control mode: legacy trigger/grip or XR hand tracking -> Fourier SDK",
+    )
+    parser.add_argument(
+        "--fourier_coord_mode",
+        type=str,
+        choices=["openxr_arm_frame", "wrist_local"],
+        default="openxr_arm_frame",
+        help="Coordinate conversion used before Fourier DexPilot retargeting",
+    )
+    parser.add_argument(
+        "--fourier_debug",
+        action="store_true",
+        help="Log periodic Fourier landmark distances and 6-DoF actions for debugging",
+    )
+    parser.add_argument(
+        "--xr_teleop_root",
+        type=str,
+        default=None,
+        help="Path to the xr_teleoperate repo used by Fourier hand control",
+    )
+    parser.add_argument(
+        "--fourier_sim",
+        action="store_true",
+        help="Run Fourier hand control in simulation mode without sending hardware SDK commands",
     )
     parser.add_argument(
         "--manager",
@@ -2196,6 +2767,11 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_mode=args.hand_mode,
+            fourier_coord_mode=args.fourier_coord_mode,
+            fourier_debug=args.fourier_debug,
+            xr_teleop_root=args.xr_teleop_root,
+            fourier_simulation_mode=args.fourier_sim,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2211,4 +2787,9 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_mode=args.hand_mode,
+            fourier_coord_mode=args.fourier_coord_mode,
+            fourier_debug=args.fourier_debug,
+            xr_teleop_root=args.xr_teleop_root,
+            fourier_simulation_mode=args.fourier_sim,
         )

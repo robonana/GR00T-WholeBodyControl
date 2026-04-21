@@ -71,6 +71,8 @@ def build_planner_message(
     upper_body_velocity: Sequence[float] | None = None,
     left_hand_position: Sequence[float] | None = None,
     right_hand_position: Sequence[float] | None = None,
+    left_hand_fourier_position: Sequence[float] | None = None,
+    right_hand_fourier_position: Sequence[float] | None = None,
     vr_3pt_position: Sequence[float] | None = None,
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
@@ -134,6 +136,28 @@ def build_planner_message(
             {"name": "right_hand_joints", "dtype": "f32", "shape": [len(right_hand_position)]}
         )
         for value in right_hand_position:
+            payload += struct.pack("<f", float(value))
+
+    if left_hand_fourier_position is not None:
+        fields.append(
+            {
+                "name": "left_hand_fourier_joints",
+                "dtype": "f32",
+                "shape": [len(left_hand_fourier_position)],
+            }
+        )
+        for value in left_hand_fourier_position:
+            payload += struct.pack("<f", float(value))
+
+    if right_hand_fourier_position is not None:
+        fields.append(
+            {
+                "name": "right_hand_fourier_joints",
+                "dtype": "f32",
+                "shape": [len(right_hand_fourier_position)],
+            }
+        )
+        for value in right_hand_fourier_position:
             payload += struct.pack("<f", float(value))
 
     if vr_3pt_position is not None:
