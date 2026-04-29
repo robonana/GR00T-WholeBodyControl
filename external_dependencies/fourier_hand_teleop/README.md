@@ -7,11 +7,12 @@ Fourier FDH-6 hand teleoperation in
 ## Contents
 
 - `dex_retargeting/`
-  Vendored DexPilot retargeting package copied from:
-  `/home/wsy/ygx/4.3/xr_teleoperate/teleop/robot_control/dex-retargeting/src/dex_retargeting`
+  Vendored DexPilot retargeting package copied from the upstream
+  `xr_teleoperate` workspace's `teleop/robot_control/dex-retargeting/src/dex_retargeting`
+  tree.
 - `assets/fourier_hand/`
-  Fourier hand YAML, URDF, and mesh assets copied from:
-  `/home/wsy/ygx/4.3/xr_teleoperate/assets/fourier_hand`
+  Fourier hand YAML, URDF, and mesh assets copied from the upstream
+  `xr_teleoperate/assets/fourier_hand` tree.
 
 ## Provenance
 
@@ -23,6 +24,12 @@ The copied license texts are preserved here as:
 
 - `LICENSE.dex_retargeting`
 - `LICENSE.xr_teleoperate`
+
+Additional integration notes:
+
+- `FOURIER_SDK_SUBNET_PATCH.md`
+  Diagnosis and reversible patch procedure for migrating the Fourier hand SDK
+  discovery broadcast from `192.168.137.x` to `192.168.123.x`.
 
 ## Why this exists
 
