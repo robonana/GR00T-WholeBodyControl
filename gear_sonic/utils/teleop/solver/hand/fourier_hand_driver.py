@@ -20,9 +20,8 @@ _VENDOR_SRC = str(VENDOR_ROOT)
 if _VENDOR_SRC not in sys.path:
     sys.path.insert(0, _VENDOR_SRC)
 
-from dex_retargeting import RetargetingConfig
-
 FOURIER_NUM_MOTORS = 6
+FOURIER_TRIGGER_DEADZONE = 0.05
 
 # Coordinate rotations from the Unitree-hand convention to the Fourier URDF convention.
 COORD_ROT_LEFT = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
@@ -44,6 +43,17 @@ JOINT_RAD_RANGES = [
     (-1.602, 0.0),  # pinky
 ]
 
+# One-DOF trigger grasp pose in hardware joint order:
+# [thumb_yaw, thumb_pitch, index, middle, ring, pinky].
+#
+# The retargeting stack regularizes q=0 as the fully-open hand.  The first
+# value in each JOINT_RAD_RANGES entry is the closed-side limit used by
+# _rad_to_normalized().
+FOURIER_TRIGGER_CLOSE_Q = np.array(
+    [limit[0] for limit in JOINT_RAD_RANGES],
+    dtype=np.float32,
+)
+
 
 class FourierHandDriver:
     """XR landmark -> DexPilot retargeting -> Fourier SDK control."""
@@ -52,8 +62,13 @@ class FourierHandDriver:
     INIT_RETRY_SLEEP_S = 1.0
     REDISCOVER_INTERVAL_S = 2.0
 
-    def __init__(self, simulation_mode: bool = False) -> None:
+    def __init__(
+        self,
+        simulation_mode: bool = False,
+        enable_retargeting: bool = True,
+    ) -> None:
         self.simulation_mode = simulation_mode
+        self.enable_retargeting = enable_retargeting
         self.left_ip: str | None = None
         self.right_ip: str | None = None
         self.fdh = None
@@ -71,11 +86,16 @@ class FourierHandDriver:
         self._latest_action = np.zeros(FOURIER_NUM_MOTORS * 2, dtype=np.float32)
         self._latest_state = np.zeros(FOURIER_NUM_MOTORS * 2, dtype=np.float32)
 
-        self._init_retargeting()
+        if self.enable_retargeting:
+            self._init_retargeting()
+        else:
+            print("[FourierHandDriver] Retargeting disabled; trigger input will drive motors directly")
         self._init_sdk()
         self._start_rediscover_thread()
 
     def _init_retargeting(self) -> None:
+        from dex_retargeting import RetargetingConfig
+
         if not FOURIER_CONFIG_PATH.exists():
             raise FileNotFoundError(f"Missing Fourier hand config: {FOURIER_CONFIG_PATH}")
 
@@ -217,6 +237,50 @@ class FourierHandDriver:
         min_val, max_val = JOINT_RAD_RANGES[hardware_idx]
         return float(np.clip((q_rad - min_val) / (max_val - min_val), 0.0, 1.0))
 
+    @staticmethod
+    def _normalized_to_rad(q_normalized: float, hardware_idx: int) -> float:
+        min_val, max_val = JOINT_RAD_RANGES[hardware_idx]
+        q = float(np.clip(q_normalized, 0.0, 1.0))
+        return float(q * (max_val - min_val) + min_val)
+
+    @classmethod
+    def _sdk_pos_to_hardware_q(cls, sdk_pos) -> np.ndarray:
+        """Convert SDK normalized get_pos() values to hardware joint-order radians."""
+        if isinstance(sdk_pos, dict):
+            sdk_pos = (
+                sdk_pos.get("pos")
+                or sdk_pos.get("position")
+                or sdk_pos.get("positions")
+            )
+        elif isinstance(sdk_pos, tuple) and len(sdk_pos) >= 2:
+            sdk_pos = sdk_pos[-1]
+
+        arr = np.asarray(sdk_pos, dtype=np.float32).reshape(-1)
+        if arr.size < FOURIER_NUM_MOTORS:
+            raise ValueError(
+                f"Expected at least {FOURIER_NUM_MOTORS} positions, got {arr.size}"
+            )
+
+        hardware_q = np.zeros(FOURIER_NUM_MOTORS, dtype=np.float32)
+        for sdk_idx, hardware_idx in enumerate(HARDWARE_TO_SDK_IDX):
+            hardware_q[hardware_idx] = cls._normalized_to_rad(arr[sdk_idx], hardware_idx)
+        return hardware_q
+
+    @staticmethod
+    def trigger_to_motor_q(trigger: float) -> np.ndarray:
+        """Map one Pico trigger value to a Fourier 6-motor grasp target.
+
+        The mapping intentionally uses only the analog trigger to preserve the
+        legacy controller semantics in pico_manager_thread_server.py where grip
+        buttons are also used as mode/data-collection modifiers.
+        """
+        close = float(np.clip(trigger, 0.0, 1.0))
+        if close <= FOURIER_TRIGGER_DEADZONE:
+            close = 0.0
+        else:
+            close = (close - FOURIER_TRIGGER_DEADZONE) / (1.0 - FOURIER_TRIGGER_DEADZONE)
+        return (close * FOURIER_TRIGGER_CLOSE_Q).astype(np.float32)
+
     def _retarget_single(
         self,
         landmarks: np.ndarray | None,
@@ -279,26 +343,39 @@ class FourierHandDriver:
             try:
                 with self._sdk_lock:
                     pos = self.fdh.get_pos(self.left_ip)
-                if pos and len(pos) >= FOURIER_NUM_MOTORS:
-                    left_state[:] = np.asarray(pos[:FOURIER_NUM_MOTORS], dtype=np.float32)
-            except Exception:
-                pass
+                if pos is not None:
+                    left_state[:] = self._sdk_pos_to_hardware_q(pos)
+            except Exception as exc:
+                print(f"[FourierHandDriver] Left hand state read error: {exc}")
         if self.right_ip:
             try:
                 with self._sdk_lock:
                     pos = self.fdh.get_pos(self.right_ip)
-                if pos and len(pos) >= FOURIER_NUM_MOTORS:
-                    right_state[:] = np.asarray(pos[:FOURIER_NUM_MOTORS], dtype=np.float32)
-            except Exception:
-                pass
+                if pos is not None:
+                    right_state[:] = self._sdk_pos_to_hardware_q(pos)
+            except Exception as exc:
+                print(f"[FourierHandDriver] Right hand state read error: {exc}")
         self._latest_state[:FOURIER_NUM_MOTORS] = left_state
         self._latest_state[FOURIER_NUM_MOTORS:] = right_state
+
+    def refresh_state(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read current Fourier motor positions via SDK get_pos().
+
+        Returns:
+            Left/right arrays in hardware joint order
+            [thumb_yaw, thumb_pitch, index, middle, ring, pinky], radians.
+        """
+        self._refresh_state()
+        return self.get_latest_state()
 
     def update_landmarks(
         self,
         left_landmarks: np.ndarray | None,
         right_landmarks: np.ndarray | None,
     ) -> None:
+        if not self.enable_retargeting:
+            raise RuntimeError("Fourier retargeting is disabled for this driver instance")
+
         left_action = self._retarget_single(
             left_landmarks,
             self.left_indices,
@@ -313,6 +390,16 @@ class FourierHandDriver:
             self.right_dex_retargeting_to_hardware,
             COORD_ROT_RIGHT,
         )
+
+        self._latest_action[:FOURIER_NUM_MOTORS] = left_action
+        self._latest_action[FOURIER_NUM_MOTORS:] = right_action
+        self._send_hand_command(left_action, right_action)
+        self._refresh_state()
+
+    def update_trigger_inputs(self, left_trigger: float, right_trigger: float) -> None:
+        """Update Fourier hands directly from Pico trigger values."""
+        left_action = self.trigger_to_motor_q(left_trigger)
+        right_action = self.trigger_to_motor_q(right_trigger)
 
         self._latest_action[:FOURIER_NUM_MOTORS] = left_action
         self._latest_action[FOURIER_NUM_MOTORS:] = right_action

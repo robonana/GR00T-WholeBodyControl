@@ -30,10 +30,12 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py              # real robot (default)
     python gear_sonic/scripts/launch_data_collection.py --sim        # MuJoCo sim
     python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer  # skip viewer
+    python gear_sonic/scripts/launch_data_collection.py --pico-hand-mode fourier_trigger
 """
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 import os
 import shutil
 import signal
@@ -115,6 +117,9 @@ class DataCollectionLaunchConfig:
     # PICO teleop options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
+
+    pico_hand_mode: Literal["trigger", "fourier", "fourier_trigger"] = "trigger"
+    """Hand mode forwarded to pico_manager_thread_server --hand_mode."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
@@ -292,6 +297,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    print(f"  PICO hand mode:  {config.pico_hand_mode}")
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print("=" * 60)
@@ -357,6 +363,7 @@ def main(config: DataCollectionLaunchConfig):
     )
     if config.pico_manager:
         pico_cmd += " --manager"
+    pico_cmd += f" --hand_mode {config.pico_hand_mode}"
     if config.pico_vis_vr3pt:
         pico_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:

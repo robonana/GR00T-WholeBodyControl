@@ -36,6 +36,52 @@ from gear_sonic.data.video_writer import VideoWriter
 disable_progress_bars()
 
 
+def _is_metadata_path(path: Path, root: Path) -> bool:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return len(rel.parts) > 0 and rel.parts[0] == "meta"
+
+
+def _cleanup_empty_partial_dataset(root: Path) -> bool:
+    """Remove an empty, partially-created dataset so creation can be retried.
+
+    LeRobot's metadata loader falls back to Hugging Face when required local
+    metadata files are missing.  A crash before the first episode can leave only
+    ``meta/info.json`` and ``meta/modality.json`` behind; that directory cannot
+    be resumed but is safe to recreate because it contains no recorded frames.
+    """
+    required_meta = [
+        root / "meta" / "info.json",
+        root / "meta" / "tasks.jsonl",
+        root / "meta" / "episodes.jsonl",
+        root / "meta" / "episodes_stats.jsonl",
+        root / "meta" / "modality.json",
+    ]
+    if all(path.exists() for path in required_meta):
+        return False
+
+    payload_files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not _is_metadata_path(path, root)
+    ]
+    if payload_files:
+        missing = [str(path.relative_to(root)) for path in required_meta if not path.exists()]
+        raise ValueError(
+            f"Existing dataset at {root} is incomplete but contains data files. "
+            f"Missing metadata: {missing}. Use a new --dataset-name or manually inspect/move it."
+        )
+
+    print(
+        f"Found incomplete empty dataset at {root}; removing metadata-only stub "
+        "and creating a fresh dataset."
+    )
+    shutil.rmtree(root)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # ArgsConfig (inlined from decoupled_wbc.control.main.config_template)
 # ---------------------------------------------------------------------------
@@ -201,13 +247,17 @@ class Gr00tDataExporter(LeRobotDataset):
             )
             shutil.rmtree(save_root)
 
-        if (Path(save_root)).exists():
+        save_root = Path(save_root)
+        if save_root.exists():
+            _cleanup_empty_partial_dataset(save_root)
+
+        if save_root.exists():
             try:
                 obj.meta = Gr00tDatasetMetadata(
                     repo_id=repo_id,
                     root=save_root,
                 )
-            except RepositoryNotFoundError as e:
+            except (RepositoryNotFoundError, FileNotFoundError, NotADirectoryError) as e:
                 raise ValueError(
                     f"Failed to resume from corrupted dataset. "
                     f"Please manually check the dataset at {save_root}"

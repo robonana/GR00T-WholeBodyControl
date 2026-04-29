@@ -137,6 +137,31 @@ source scripts/setup_env.sh
 cd ..
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
+
+# If you are using Fourier FDH-6 hands and want Pico trigger control instead,
+# run this Terminal 3 command:
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier_trigger
+```
+
+### Hand control modes
+
+The PICO teleop manager supports three hand-control modes through
+`--hand_mode`:
+
+| Mode | Command option | Behavior |
+| --- | --- | --- |
+| Legacy trigger/grip | `--hand_mode trigger` or omit `--hand_mode` | Original G1/Dex3 7-DOF hand mapping from Pico trigger/grip inputs. |
+| Fourier XR hand tracking | `--hand_mode fourier` | XR hand-tracking landmarks are retargeted to Fourier FDH-6 and sent through the Fourier SDK. |
+| Fourier trigger control | `--hand_mode fourier_trigger` | Pico left/right analog triggers directly open/close the left/right Fourier FDH-6 hands. |
+
+> For trigger-controlled Fourier hands, use `--hand_mode fourier_trigger`.
+> Do **not** use `--hand_mode fourier` unless you want XR hand-tracking control.
+
+Default legacy mode:
+
+```bash
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
 
 For Fourier FDH-6 hands driven directly from XR hand tracking:
@@ -148,10 +173,65 @@ pip install dexhandpy
 python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
 ```
 
+For Fourier FDH-6 hands driven directly from the Pico controller triggers
+(left trigger controls the left hand, right trigger controls the right hand):
+
+```bash
+source .venv_teleop/bin/activate
+pip install pybind11
+pip install dexhandpy
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier_trigger
+```
+
+In `fourier_trigger` mode:
+
+- left trigger = left Fourier hand open/close
+- right trigger = right Fourier hand open/close
+- trigger value `0.0` = open, `1.0` = full close target
+- Pico grip buttons remain available for existing manager/data-collection shortcuts
+
 Keyboard fallbacks in the `pico_manager_thread_server.py` terminal:
 
 - `a` = `A+B+X+Y` (start/stop policy)
 - `b` = `A+X` (toggle `PLANNER` / `POSE`)
+
+### Data collection with Fourier hands
+
+When you use the all-in-one data-collection launcher, pass the PICO hand mode
+through `--pico-hand-mode`. For trigger-controlled Fourier FDH-6 collection,
+run:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+  --camera-host 192.168.123.164 \
+  --dataset-name real_test_001 \
+  --task-prompt "test data collection" \
+  --pico-hand-mode fourier_trigger
+```
+
+`launch_data_collection.py --pico-hand-mode fourier_trigger` forwards
+`--hand_mode fourier_trigger` to `pico_manager_thread_server.py`. The exporter
+saves the commanded Fourier targets as:
+
+- `teleop.left_hand_fourier_joints` — 6 values in
+  `[thumb_yaw, thumb_pitch, index, middle, ring, pinky]` order
+- `teleop.right_hand_fourier_joints` — same 6-value order
+
+It also reads Fourier SDK `get_pos()` feedback and saves the measured motor
+positions, converted to the same order/radian units:
+
+- `observation.left_hand_fourier_actual_joints`
+- `observation.right_hand_fourier_actual_joints`
+
+Without `--pico-hand-mode fourier_trigger`, the launcher keeps the default
+legacy `trigger` hand mode and will not command Fourier hands.
+
+To test only the Fourier feedback path without sending motor commands:
+
+```bash
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/test_fourier_hand_feedback.py
+```
 
 ## Kinematic Planner
 

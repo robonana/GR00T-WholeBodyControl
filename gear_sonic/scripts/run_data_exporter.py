@@ -244,6 +244,7 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_fourier_state_msg = None
 
         self.current_stream_mode = 0
 
@@ -267,9 +268,10 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "fourier_state")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            print("[Sonic] Subscribed to: pose, planner, manager_state")
+            print("[Sonic] Subscribed to: pose, planner, manager_state, fourier_state")
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
@@ -348,6 +350,8 @@ class GrootDataCollector:
 
             if raw.startswith(b"manager_state"):
                 self._handle_manager_state(raw)
+            elif raw.startswith(b"fourier_state"):
+                self._handle_fourier_state(raw)
             elif raw.startswith(b"planner"):
                 self._handle_planner_message(raw)
             elif raw.startswith(b"pose"):
@@ -366,6 +370,22 @@ class GrootDataCollector:
             self._manager_toggle_dc = True
         if self._extract_bool(data, "toggle_data_abort"):
             self._manager_toggle_da = True
+
+    def _handle_fourier_state(self, raw: bytes) -> None:
+        try:
+            data = unpack_pose_message(raw, topic="fourier_state")
+        except Exception:
+            return
+
+        self.latest_fourier_state_msg = {
+            "left_hand_fourier_actual_joints": self._extract_optional_vector(
+                data, "left_hand_fourier_actual_joints", 6
+            ),
+            "right_hand_fourier_actual_joints": self._extract_optional_vector(
+                data, "right_hand_fourier_actual_joints", 6
+            ),
+            "receive_timestamp": time.time(),
+        }
 
     def _handle_planner_message(self, raw: bytes) -> None:
         try:
@@ -409,6 +429,12 @@ class GrootDataCollector:
             ),
             "right_hand_fourier_joints": self._extract_optional_vector(
                 data, "right_hand_fourier_joints", 6
+            ),
+            "left_hand_fourier_actual_joints": self._extract_optional_vector(
+                data, "left_hand_fourier_actual_joints", 6
+            ),
+            "right_hand_fourier_actual_joints": self._extract_optional_vector(
+                data, "right_hand_fourier_actual_joints", 6
             ),
             "receive_timestamp": time.time(),
         }
@@ -489,6 +515,12 @@ class GrootDataCollector:
                 ),
                 "right_hand_fourier_joints": self._extract_optional_vector(
                     pose_data, "right_hand_fourier_joints", 6
+                ),
+                "left_hand_fourier_actual_joints": self._extract_optional_vector(
+                    pose_data, "left_hand_fourier_actual_joints", 6
+                ),
+                "right_hand_fourier_actual_joints": self._extract_optional_vector(
+                    pose_data, "right_hand_fourier_actual_joints", 6
                 ),
                 "left_wrist_joints": left_wrist_joints,
                 "right_wrist_joints": right_wrist_joints,
@@ -785,6 +817,37 @@ class GrootDataCollector:
             if hand_msg is not None
             and hand_msg.get("right_hand_joints") is not None
             else np.zeros(7, dtype=np.float32)
+        )
+        frame_data["teleop.left_hand_fourier_joints"] = (
+            hand_msg["left_hand_fourier_joints"].astype(np.float32)
+            if hand_msg is not None
+            and hand_msg.get("left_hand_fourier_joints") is not None
+            else np.zeros(6, dtype=np.float32)
+        )
+        frame_data["teleop.right_hand_fourier_joints"] = (
+            hand_msg["right_hand_fourier_joints"].astype(np.float32)
+            if hand_msg is not None
+            and hand_msg.get("right_hand_fourier_joints") is not None
+            else np.zeros(6, dtype=np.float32)
+        )
+
+        fourier_state_msg = self.latest_fourier_state_msg
+        use_fourier_state = False
+        if fourier_state_msg is not None:
+            receive_ts = fourier_state_msg.get("receive_timestamp")
+            use_fourier_state = receive_ts is None or (time.time() - receive_ts) <= 0.5
+        fourier_actual_msg = fourier_state_msg if use_fourier_state else hand_msg
+        frame_data["observation.left_hand_fourier_actual_joints"] = (
+            fourier_actual_msg["left_hand_fourier_actual_joints"].astype(np.float32)
+            if fourier_actual_msg is not None
+            and fourier_actual_msg.get("left_hand_fourier_actual_joints") is not None
+            else np.zeros(6, dtype=np.float32)
+        )
+        frame_data["observation.right_hand_fourier_actual_joints"] = (
+            fourier_actual_msg["right_hand_fourier_actual_joints"].astype(np.float32)
+            if fourier_actual_msg is not None
+            and fourier_actual_msg.get("right_hand_fourier_actual_joints") is not None
+            else np.zeros(6, dtype=np.float32)
         )
 
         # Planner command fields

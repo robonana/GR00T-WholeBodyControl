@@ -20,6 +20,14 @@ EGO_VIEW_WIDTH: int = 640
 WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
 FPS: int = 50
+FOURIER_HAND_JOINT_NAMES: list[str] = [
+    "thumb_yaw",
+    "thumb_pitch",
+    "index",
+    "middle",
+    "ring",
+    "pinky",
+]
 
 
 _JOINT_GROUPS_FOR_STATE: list[str] = [
@@ -97,6 +105,16 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "original_key": "observation.init_base_quat",
                 "rotation_type": "quaternion",
             },
+            "left_hand_fourier_actual_joints": {
+                "start": 0,
+                "end": 6,
+                "original_key": "observation.left_hand_fourier_actual_joints",
+            },
+            "right_hand_fourier_actual_joints": {
+                "start": 0,
+                "end": 6,
+                "original_key": "observation.right_hand_fourier_actual_joints",
+            },
         },
         "action": {
             "delta_heading": {
@@ -140,6 +158,16 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "start": 0,
                 "end": 7,
                 "original_key": "teleop.right_hand_joints",
+            },
+            "left_hand_fourier_joints": {
+                "start": 0,
+                "end": 6,
+                "original_key": "teleop.left_hand_fourier_joints",
+            },
+            "right_hand_fourier_joints": {
+                "start": 0,
+                "end": 6,
+                "original_key": "teleop.right_hand_fourier_joints",
             },
             "left_wrist_joints": {
                 "start": 0,
@@ -256,6 +284,16 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (4,),
             "names": ["init_base_qw", "init_base_qx", "init_base_qy", "init_base_qz"],
         },
+        "observation.left_hand_fourier_actual_joints": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [f"left_fourier_actual_{name}" for name in FOURIER_HAND_JOINT_NAMES],
+        },
+        "observation.right_hand_fourier_actual_joints": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [f"right_fourier_actual_{name}" for name in FOURIER_HAND_JOINT_NAMES],
+        },
         "teleop.delta_heading": {
             "dtype": "float64",
             "shape": (1,),
@@ -302,6 +340,16 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float32",
             "shape": (7,),
             "names": "right_hand_joints",
+        },
+        "teleop.left_hand_fourier_joints": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [f"left_fourier_{name}" for name in FOURIER_HAND_JOINT_NAMES],
+        },
+        "teleop.right_hand_fourier_joints": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [f"right_fourier_{name}" for name in FOURIER_HAND_JOINT_NAMES],
         },
         "teleop.smpl_frame_index": {
             "dtype": "int64",

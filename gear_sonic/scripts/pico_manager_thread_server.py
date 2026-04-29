@@ -203,6 +203,10 @@ T_TO_UNITREE_HAND = np.array(
 )
 T_TO_UNITREE_HAND_ROT = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
 FOURIER_ZERO_ACTION = np.zeros(6, dtype=np.float32)
+HAND_MODE_TRIGGER = "trigger"
+HAND_MODE_FOURIER_TRACKING = "fourier"
+HAND_MODE_FOURIER_TRIGGER = "fourier_trigger"
+FOURIER_HAND_MODES = {HAND_MODE_FOURIER_TRACKING, HAND_MODE_FOURIER_TRIGGER}
 
 
 class KeyboardHotkeyBridge:
@@ -721,11 +725,16 @@ def init_fourier_hand_driver(
     fourier_simulation_mode: bool = False,
 ):
     """Initialize the optional Fourier hand driver."""
-    if hand_mode != "fourier":
+    if hand_mode not in FOURIER_HAND_MODES:
         return None
     if FourierHandDriver is None:
-        raise ImportError("FourierHandDriver unavailable but hand_mode='fourier' was requested.")
-    return FourierHandDriver(simulation_mode=fourier_simulation_mode)
+        raise ImportError(
+            f"FourierHandDriver unavailable but hand_mode='{hand_mode}' was requested."
+        )
+    return FourierHandDriver(
+        simulation_mode=fourier_simulation_mode,
+        enable_retargeting=hand_mode == HAND_MODE_FOURIER_TRACKING,
+    )
 
 
 def get_controller_inputs():
@@ -953,6 +962,39 @@ def compute_fourier_hand_joints_from_tracking(
         return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy(), None, None
 
 
+def compute_fourier_hand_joints_from_triggers(
+    hand_driver,
+    left_trigger: float,
+    right_trigger: float,
+):
+    """Update Fourier hands from Pico trigger values and return the latest 6-DoF targets."""
+    if hand_driver is None:
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+
+    try:
+        hand_driver.update_trigger_inputs(left_trigger, right_trigger)
+        return hand_driver.get_latest_action()
+    except Exception as exc:
+        print(f"[FourierHandDriver] trigger update failed: {exc}")
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+
+
+def get_fourier_hand_actual_joints(hand_driver, refresh: bool = False):
+    """Return latest Fourier get_pos() feedback in hardware joint order/radians."""
+    if hand_driver is None:
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+
+    try:
+        if refresh:
+            refresh_state = getattr(hand_driver, "refresh_state", None)
+            if callable(refresh_state):
+                return refresh_state()
+        return hand_driver.get_latest_state()
+    except Exception as exc:
+        print(f"[FourierHandDriver] state read failed: {exc}")
+        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
+
+
 class FourierHandDebug:
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
@@ -987,6 +1029,25 @@ class FourierHandDebug:
             f"R(thumb-index={_tip_distance(right_landmarks, 4, 9):.4f}, "
             f"thumb-middle={_tip_distance(right_landmarks, 4, 14):.4f}, "
             f"action={np.round(right_action, 4).tolist()})"
+        )
+
+    def maybe_log_trigger(
+        self,
+        left_trigger: float,
+        right_trigger: float,
+        left_action: np.ndarray,
+        right_action: np.ndarray,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self._last_log < 2.0:
+            return
+        self._last_log = now
+        print(
+            "[FourierTriggerDebug] "
+            f"L(trigger={left_trigger:.3f}, action={np.round(left_action, 4).tolist()}) "
+            f"R(trigger={right_trigger:.3f}, action={np.round(right_action, 4).tolist()})"
         )
 
 
@@ -1137,11 +1198,13 @@ def _pose_stream_common(
         hand_mode=hand_mode,
         fourier_simulation_mode=fourier_simulation_mode,
     )
-    if hand_mode == "fourier":
+    if hand_mode == HAND_MODE_FOURIER_TRACKING:
         print(
             f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
             "(recommended: openxr_arm_frame)"
         )
+    elif hand_mode == HAND_MODE_FOURIER_TRIGGER:
+        print("[FourierHandDriver] trigger mode: Pico L/R triggers drive Fourier hands")
 
     streamer = PoseStreamer(
         socket=socket,
@@ -1518,7 +1581,7 @@ class PoseStreamer:
             hand_mode=hand_mode,
             fourier_simulation_mode=fourier_simulation_mode,
         )
-        if hand_mode == "trigger":
+        if hand_mode == HAND_MODE_TRIGGER:
             self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
         else:
             self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
@@ -1618,7 +1681,7 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        if self.hand_mode == "fourier":
+        if self.hand_mode == HAND_MODE_FOURIER_TRACKING:
             left_hand_joints = np.zeros((1, 7), dtype=np.float32)
             right_hand_joints = np.zeros((1, 7), dtype=np.float32)
             left_hand_fourier_joints, right_hand_fourier_joints, left_landmarks, right_landmarks = (
@@ -1633,6 +1696,28 @@ class PoseStreamer:
                 left_hand_fourier_joints,
                 right_hand_fourier_joints,
             )
+            left_hand_fourier_actual_joints, right_hand_fourier_actual_joints = (
+                get_fourier_hand_actual_joints(self.fourier_hand_driver)
+            )
+        elif self.hand_mode == HAND_MODE_FOURIER_TRIGGER:
+            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            left_hand_fourier_joints, right_hand_fourier_joints = (
+                compute_fourier_hand_joints_from_triggers(
+                    self.fourier_hand_driver,
+                    left_trigger,
+                    right_trigger,
+                )
+            )
+            self.fourier_debug.maybe_log_trigger(
+                left_trigger,
+                right_trigger,
+                left_hand_fourier_joints,
+                right_hand_fourier_joints,
+            )
+            left_hand_fourier_actual_joints, right_hand_fourier_actual_joints = (
+                get_fourier_hand_actual_joints(self.fourier_hand_driver)
+            )
         else:
             left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
                 self.left_hand_ik_solver,
@@ -1644,6 +1729,8 @@ class PoseStreamer:
             )
             left_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
             right_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
+            left_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
+            right_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1812,6 +1899,20 @@ class PoseStreamer:
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
             self.socket.send(packed_message)
+            if self.hand_mode in FOURIER_HAND_MODES:
+                self.socket.send(
+                    pack_pose_message(
+                        {
+                            "left_hand_fourier_actual_joints": (
+                                left_hand_fourier_actual_joints.astype(np.float32)
+                            ),
+                            "right_hand_fourier_actual_joints": (
+                                right_hand_fourier_actual_joints.astype(np.float32)
+                            ),
+                        },
+                        topic="fourier_state",
+                    )
+                )
 
             if self.record_dir:
                 out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")
@@ -2008,7 +2109,7 @@ class PlannerStreamer:
             hand_mode=hand_mode,
             fourier_simulation_mode=fourier_simulation_mode,
         )
-        if hand_mode == "trigger":
+        if hand_mode == HAND_MODE_TRIGGER:
             self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
         else:
             self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
@@ -2104,6 +2205,39 @@ class PlannerStreamer:
             right_hand_position = None
             left_hand_fourier_position = None
             right_hand_fourier_position = None
+            left_hand_fourier_actual_position = None
+            right_hand_fourier_actual_position = None
+            if self.hand_mode == HAND_MODE_FOURIER_TRIGGER:
+                (
+                    _left_menu_button,
+                    left_trigger,
+                    right_trigger,
+                    _left_grip,
+                    _right_grip,
+                ) = get_controller_inputs()
+                lh_fourier, rh_fourier = compute_fourier_hand_joints_from_triggers(
+                    self.fourier_hand_driver,
+                    left_trigger,
+                    right_trigger,
+                )
+                self.fourier_debug.maybe_log_trigger(
+                    left_trigger,
+                    right_trigger,
+                    lh_fourier,
+                    rh_fourier,
+                )
+                left_hand_fourier_position = lh_fourier.astype(np.float32).tolist()
+                right_hand_fourier_position = rh_fourier.astype(np.float32).tolist()
+                lh_fourier_actual, rh_fourier_actual = get_fourier_hand_actual_joints(
+                    self.fourier_hand_driver
+                )
+                left_hand_fourier_actual_position = (
+                    lh_fourier_actual.astype(np.float32).tolist()
+                )
+                right_hand_fourier_actual_position = (
+                    rh_fourier_actual.astype(np.float32).tolist()
+                )
+
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
                 left_hand_position = self.feedback_reader.left_hand_position_target
@@ -2120,7 +2254,7 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                if self.hand_mode == "fourier":
+                if self.hand_mode == HAND_MODE_FOURIER_TRACKING:
                     (
                         lh_fourier,
                         rh_fourier,
@@ -2138,7 +2272,16 @@ class PlannerStreamer:
                     )
                     left_hand_fourier_position = lh_fourier.astype(np.float32).tolist()
                     right_hand_fourier_position = rh_fourier.astype(np.float32).tolist()
-                else:
+                    lh_fourier_actual, rh_fourier_actual = get_fourier_hand_actual_joints(
+                        self.fourier_hand_driver
+                    )
+                    left_hand_fourier_actual_position = (
+                        lh_fourier_actual.astype(np.float32).tolist()
+                    )
+                    right_hand_fourier_actual_position = (
+                        rh_fourier_actual.astype(np.float32).tolist()
+                    )
+                elif self.hand_mode == HAND_MODE_TRIGGER:
                     # Compute hand joints from trigger/grip inputs so operator can
                     # control hand open/close while in VR 3PT mode
                     (
@@ -2175,6 +2318,20 @@ class PlannerStreamer:
                 vr_3pt_compliance=vr_3pt_compliance,
             )
             self.socket.send(msg)
+            if left_hand_fourier_actual_position is not None:
+                self.socket.send(
+                    pack_pose_message(
+                        {
+                            "left_hand_fourier_actual_joints": np.asarray(
+                                left_hand_fourier_actual_position, dtype=np.float32
+                            ),
+                            "right_hand_fourier_actual_joints": np.asarray(
+                                right_hand_fourier_actual_position, dtype=np.float32
+                            ),
+                        },
+                        topic="fourier_state",
+                    )
+                )
         except Exception as e:
             import traceback
 
@@ -2258,11 +2415,13 @@ def run_pico_manager(
         hand_mode=hand_mode,
         fourier_simulation_mode=fourier_simulation_mode,
     )
-    if hand_mode == "fourier":
+    if hand_mode == HAND_MODE_FOURIER_TRACKING:
         print(
             f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
             "(recommended: openxr_arm_frame)"
         )
+    elif hand_mode == HAND_MODE_FOURIER_TRIGGER:
+        print("[FourierHandDriver] trigger mode: Pico L/R triggers drive Fourier hands")
 
     pose_streamer = PoseStreamer(
         socket=socket,
@@ -2526,9 +2685,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hand_mode",
         type=str,
-        choices=["trigger", "fourier"],
-        default="trigger",
-        help="Hand control mode: legacy trigger/grip or XR hand tracking -> Fourier SDK",
+        choices=[
+            HAND_MODE_TRIGGER,
+            HAND_MODE_FOURIER_TRACKING,
+            HAND_MODE_FOURIER_TRIGGER,
+        ],
+        default=HAND_MODE_TRIGGER,
+        help=(
+            "Hand control mode: legacy trigger/grip, "
+            "XR hand tracking -> Fourier SDK, or trigger -> Fourier SDK"
+        ),
     )
     parser.add_argument(
         "--fourier_debug",
