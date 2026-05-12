@@ -279,7 +279,11 @@ class FourierHandDriver:
             close = 0.0
         else:
             close = (close - FOURIER_TRIGGER_DEADZONE) / (1.0 - FOURIER_TRIGGER_DEADZONE)
-        return (close * FOURIER_TRIGGER_CLOSE_Q).astype(np.float32)
+
+        motor_q = (close * FOURIER_TRIGGER_CLOSE_Q).astype(np.float32)
+        # Fix thumb_yaw at fully adducted position (-1.676 rad)
+        motor_q[0] = JOINT_RAD_RANGES[0][0]
+        return motor_q
 
     def _retarget_single(
         self,
