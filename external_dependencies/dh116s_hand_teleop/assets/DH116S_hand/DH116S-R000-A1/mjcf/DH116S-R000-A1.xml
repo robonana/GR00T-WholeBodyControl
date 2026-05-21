@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MuJoCo MJCF model for DH116S-R000-A1 Dexterous Hand (Right)
+  ============================================================
+  Converted from SolidWorks URDF export.
+
+  ── 关节分类 ──────────────────────────────────────────────────
+  主动关节 (6 个，独立 DOF，有执行器):
+    finger11 : 拇指摆动    (MCP ab/adduction)
+    finger12 : 拇指屈曲    (MCP flexion)
+    finger21 : 食指 MCP
+    finger31 : 中指 MCP
+    finger41 : 无名指 MCP
+    finger51 : 小拇指 MCP
+
+  从动关节 (5 个，equality 约束，被动跟随):
+    finger13 : 拇指 IP      跟随 finger12
+    finger22 : 食指 PIP     跟随 finger21
+    finger32 : 中指 PIP     跟随 finger31
+    finger42 : 无名指 PIP   跟随 finger41
+    finger52 : 小拇指 PIP   跟随 finger51
+
+  固连体 (5 个，和父连杆完全固连，无关节):
+    finger14_link : 拇指橡胶垫   (rigidly attached to finger13_link)
+    finger23_link : 食指橡胶垫   (rigidly attached to finger22_link)
+    finger33_link : 中指橡胶垫   (rigidly attached to finger32_link)
+    finger43_link : 无名指橡胶垫 (rigidly attached to finger42_link)
+    finger53_link : 小拇指橡胶垫 (rigidly attached to finger52_link)
+
+  ── Equality 多项式说明 ──────────────────────────────────────
+  原始公式 (单位: 角度°):
+    大拇指:  y = -0.0008x² + 0.929x  - 0.8639
+    食指:    y =  0.0067x² + 0.8847x + 2.1926
+    中指:    y =  0.0076x² + 0.8485x + 2.0597
+    无名指:  y =  0.0079x² + 0.8321x + 2.4732
+    小拇指:  y =  0.0075x² + 0.7349x + 2.0181
+
+  MuJoCo polycoef 换算 (单位: 弧度 rad):
+    y_deg = C0 + C1*x_deg + C2*x_deg²
+    y_rad = C0*(π/180) + C1*x_rad + C2*(180/π)*x_rad²
+    polycoef = "C0*(π/180)  C1  C2*(180/π)  0  0"
+--><mujoco model="DH116S-R000-A1">
+
+  <compiler angle="radian" meshdir="../meshes" eulerseq="XYZ" autolimits="true"/>
+  <option gravity="0 0 -9.81" timestep="0.002" iterations="100"/>
+
+  <default>
+    <!-- 统一关节阻尼与虚拟惯量，配合位置执行器形成过阻尼响应，减小摇晃 -->
+    <joint type="hinge" damping="2.0" armature="0.01" frictionloss="0"/>
+    <!-- 默认关闭接触参与；需要接触的被动指节/胶垫在各自 geom 上单独覆盖 -->
+    <geom condim="4" friction="1.0 0.005 0.001" contype="0" conaffinity="0"/>
+    <!-- equality: 减小 solref[0] 时间常数 → 约束更硬，残差更小 -->
+    <equality solref="0.004 1" solimp="0.9 0.99 0.001 0.5 2"/>
+  </default>
+
+  <!-- ==================== 网格资源 ==================== -->
+  <asset>
+    <mesh name="base_link" file="base_link.STL"/>
+    <mesh name="finger11_link" file="finger11_link.STL"/>
+    <mesh name="finger12_link" file="finger12_link.STL"/>
+    <mesh name="finger13_link" file="finger13_link.STL"/>
+    <mesh name="finger14_link" file="finger14_link.STL"/>
+    <mesh name="finger21_link" file="finger21_link.STL"/>
+    <mesh name="finger22_link" file="finger22_link.STL"/>
+    <mesh name="finger23_link" file="finger23_link.STL"/>
+    <mesh name="finger31_link" file="finger31_link.STL"/>
+    <mesh name="finger32_link" file="finger32_link.STL"/>
+    <mesh name="finger33_link" file="finger33_link.STL"/>
+    <mesh name="finger41_link" file="finger41_link.STL"/>
+    <mesh name="finger42_link" file="finger42_link.STL"/>
+    <mesh name="finger43_link" file="finger43_link.STL"/>
+    <mesh name="finger51_link" file="finger51_link.STL"/>
+    <mesh name="finger52_link" file="finger52_link.STL"/>
+    <mesh name="finger53_link" file="finger53_link.STL"/>
+  </asset>
+
+  <!-- ==================== 运动体树 ==================== -->
+  <worldbody>
+
+    <!-- 手掌基座（焊死在世界坐标系） -->
+    <body name="base_link" pos="0 0 0">
+      <geom name="base_link" type="mesh" mesh="base_link" rgba="0.85 0.85 0.85 1"/>
+      <inertial pos="0.000384322111287069 0.00753084251208742 0.0472909739889326" mass="0.109379461925353" fullinertia="4.8658626062114E-05 6.96839906122602E-05 3.07683899448741E-05 1.90165367140657E-07 4.76749750234747E-07 -2.36133057842731E-06"/>
+
+      <!-- ===== 手指 1：大拇指 (Thumb) ===== -->
+
+      <!--
+        finger11: 主动 — 拇指摆动 (MCP ab/adduction)
+        绕 -Z 轴，范围 0~1.588 rad，独立执行器驱动
+      -->
+      <body name="finger11_link" pos="0.019011443942029 -0.00780399999999971 0.0343199999999998" euler="0 0 1.4189526818714">
+        <joint name="finger11" axis="0 0 -1" range="0 1.588"/>
+        <geom name="finger11_link" type="mesh" mesh="finger11_link" rgba="0.9 0.9 0.9 1"/>
+        <inertial pos="-0.000106936701499152 -0.00887532166965714 0.00188503573341194" mass="0.00704884300354655" fullinertia="9.65962069608261E-07 9.82359201731221E-07 2.90732053006428E-07 -1.44438396657121E-08 -2.78802353633112E-08 1.16859938665557E-07"/>
+
+        <!--
+          finger12: 主动 — 拇指 MCP 屈曲 (MCP flexion)
+          绕 -X 轴，范围 0~1.030 rad，独立执行器驱动
+        -->
+        <body name="finger12_link" pos="-0.00241716818193387 -0.0149999999957004 0.00671430739411609" euler="0.914460600969039 -0.26179938779915 0">
+          <joint name="finger12" axis="-1 0 0" range="0 1.030"/>
+          <geom name="finger12_link" type="mesh" mesh="finger12_link" rgba="0.9 0.9 0.9 1"/>
+          <inertial pos="0.00575146979629403 -0.00980743444616855 0.019859071306553" mass="0.00572064501582461" fullinertia="1.07119834760592E-06 1.23181109053526E-06 6.0079268566964E-07 4.58213387989754E-08 -7.67707579266534E-08 3.23507378708491E-07"/>
+
+          <!--
+            finger13: 从动 — 拇指 IP (interphalangeal)
+            绕 -X 轴，由 equality 约束跟随 finger12 (MCP flexion)
+            原始公式(°): y = -0.0008x² + 0.929x - 0.8639
+            polycoef(rad): [-0.015082, 0.929, -0.045837, 0, 0]
+          -->
+          <body name="finger13_link" pos="0.00598654106733671 -0.0125165261747051 0.0381626484720598" euler="0.382919042912385 0.147573481949468 0.0154304498115495">
+            <joint name="finger13" axis="-1 0 0" range="0 1.13"/>
+            <geom name="finger13_link" type="mesh" mesh="finger13_link" rgba="0.9 0.9 0.9 1" contype="1" conaffinity="1"/>
+            <inertial pos="0.00252081313880359 -0.00372563202308732 0.00904163814125886" mass="0.00512347606012059" fullinertia="2.40947986098038E-07 3.07751181192004E-07 1.61697663271219E-07 -5.09796574066595E-10 -9.60704042330482E-10 -7.35260411693152E-09"/>
+
+            <!--
+              finger14_link: 拇指橡胶垫
+              无关节，完全固连到 finger13_link，随 IP 一同运动
+            -->
+            <body name="finger14_link" pos="0 0 0" euler="0 0 0">
+              <geom name="finger14_link" type="mesh" mesh="finger14_link" rgba="0.2 0.2 0.2 1" contype="1" conaffinity="1"/>
+              <inertial pos="0.00249769126018826 0.00167067101210644 0.0123801371744446" mass="0.00240482348656883" fullinertia="6.51224324821768E-08 9.9767942266961E-08 5.5208299164458E-08 -2.76696868457692E-10 -6.12678170657889E-10 3.06755746735259E-09"/>
+            </body>
+
+          </body>
+        </body>
+      </body>
+
+      <!-- ===== 手指 2：食指 (Index) ===== -->
+
+      <!--
+        finger21: 主动 — 食指 MCP
+        绕 +X 轴，范围 0~1.257 rad，独立执行器驱动
+      -->
+      <body name="finger21_link" pos="0.0262687686016299 0.00528244145664834 0.0838772330726273" euler="0.184030828348921 0.0900710961718212 0">
+        <joint name="finger21" axis="1 0 0" range="0 1.257"/>
+        <geom name="finger21_link" type="mesh" mesh="finger21_link" rgba="0.9 0.9 0.9 1"/>
+        <inertial pos="0.00027210041910733 0.00170234735088368 0.014516323212758" mass="0.00393774528740839" fullinertia="3.16719166363702E-07 3.45533063039298E-07 1.51382459897184E-07 4.75695190346559E-09 1.33068275020846E-09 7.7985196786372E-09"/>
+
+        <!--
+          finger22: 从动 — 食指 PIP
+          绕 +X 轴，由 equality 约束跟随 finger21 (MCP)
+          原始公式(°): y = 0.0067x² + 0.8847x + 2.1926
+          polycoef(rad): [0.038265, 0.8847, 0.383882, 0, 0]
+        -->
+        <body name="finger22_link" pos="0 0 0.028026675184573" euler="0 0 0">
+          <joint name="finger22" axis="1 0 0" range="0 1.75"/>
+          <geom name="finger22_link" type="mesh" mesh="finger22_link" rgba="0.9 0.9 0.9 1" contype="1" conaffinity="1"/>
+          <inertial pos="0.000180892622891587 0.00133699393436336 0.010912976228776" mass="0.00359509305446838" fullinertia="3.71495920772452E-07 3.74339102526511E-07 6.27179802580373E-08 3.3566423592835E-10 8.81868087157963E-09 4.09550241976548E-08"/>
+
+          <!--
+            finger23_link: 食指橡胶垫
+            无关节，完全固连到 finger22_link，随 PIP 一同运动
+          -->
+          <body name="finger23_link" pos="0 0 0" euler="0 0 0">
+            <geom name="finger23_link" type="mesh" mesh="finger23_link" rgba="0.2 0.2 0.2 1" contype="1" conaffinity="1"/>
+            <inertial pos="-0.000690109619396834 -0.00377783340062988 0.0191163501361598" mass="0.00194916130998001" fullinertia="9.25442673743886E-08 9.46455434630362E-08 3.02508825822761E-08 3.79093542922402E-10 3.55204790224285E-09 2.17891055188829E-08"/>
+          </body>
+
+        </body>
+      </body>
+
+      <!-- ===== 手指 3：中指 (Middle) ===== -->
+
+      <!--
+        finger31: 主动 — 中指 MCP
+        绕 +X 轴，范围 0~1.257 rad，独立执行器驱动
+      -->
+      <body name="finger31_link" pos="0.00874401205559361 0.00650966935499851 0.0881661201014335" euler="0.175821944347936 0.05205044550937 -0.0495268334341439">
+        <joint name="finger31" axis="1 0 0" range="0 1.257"/>
+        <geom name="finger31_link" type="mesh" mesh="finger31_link" rgba="0.9 0.9 0.9 1"/>
+        <inertial pos="-2.41743304470188E-06 0.0016881536103133 0.0166092629083552" mass="0.00465632374460654" fullinertia="4.64032038497059E-07 4.96217078056825E-07 1.78406731079551E-07 -6.14756143609671E-11 5.30642140220418E-11 1.19847357277137E-08"/>
+
+        <!--
+          finger32: 从动 — 中指 PIP
+          绕 +X 轴，由 equality 约束跟随 finger31 (MCP)
+          原始公式(°): y = 0.0076x² + 0.8485x + 2.0597
+          polycoef(rad): [0.035946, 0.8485, 0.435448, 0, 0]
+        -->
+        <body name="finger32_link" pos="0 -0.000265259842373017 0.0325298807757662" euler="0 0 0">
+          <joint name="finger32" axis="1 0 0" range="0 1.75"/>
+          <geom name="finger32_link" type="mesh" mesh="finger32_link" rgba="0.9 0.9 0.9 1" contype="1" conaffinity="1"/>
+          <inertial pos="-4.52052482557974E-07 0.000239188481448136 0.0125647103929899" mass="0.00396485659955852" fullinertia="5.13613810914939E-07 5.04420042058448E-07 8.36320010149996E-08 -3.89316581101276E-10 1.51691231313048E-09 9.32849272033081E-08"/>
+
+          <!--
+            finger33_link: 中指橡胶垫
+            无关节，完全固连到 finger32_link，随 PIP 一同运动
+          -->
+          <body name="finger33_link" pos="0 0 0" euler="0 0 0">
+            <geom name="finger33_link" type="mesh" mesh="finger33_link" rgba="0.2 0.2 0.2 1" contype="1" conaffinity="1"/>
+            <inertial pos="1.11963736759702E-06 -0.00561969015110605 0.021082467343861" mass="0.00227280089263279" fullinertia="1.47858333672132E-07 1.41914584192602E-07 4.21604565911276E-08 1.18576994854538E-12 -4.80407376657536E-12 4.17788434922029E-08"/>
+          </body>
+
+        </body>
+      </body>
+
+      <!-- ===== 手指 4：无名指 (Ring) ===== -->
+
+      <!--
+        finger41: 主动 — 无名指 MCP
+        绕 +X 轴，范围 0~1.257 rad，独立执行器驱动
+      -->
+      <body name="finger41_link" pos="-0.00884629646917347 0.007306751562741 0.0874130612220856" euler="0.185216698200614 -0.0252760066009568 0">
+        <joint name="finger41" axis="1 0 0" range="0 1.257"/>
+        <geom name="finger41_link" type="mesh" mesh="finger41_link" rgba="0.9 0.9 0.9 1"/>
+        <inertial pos="-9.92502562325998E-05 0.00187501159969453 0.014820900729557" mass="0.0041427825906401" fullinertia="3.6220134054032E-07 3.93202304061915E-07 1.57968682958101E-07 -1.65704576345153E-09 -5.59535256816269E-10 1.16626470854897E-08"/>
+
+        <!--
+          finger42: 从动 — 无名指 PIP
+          绕 +X 轴，由 equality 约束跟随 finger41 (MCP)
+          原始公式(°): y = 0.0079x² + 0.8321x + 2.4732
+          polycoef(rad): [0.043170, 0.8321, 0.452637, 0, 0]
+        -->
+        <body name="finger42_link" pos="0 0 0.0295285227667386" euler="0 0 0">
+          <joint name="finger42" axis="1 0 0" range="0 1.75"/>
+          <geom name="finger42_link" type="mesh" mesh="finger42_link" rgba="0.9 0.9 0.9 1" contype="1" conaffinity="1"/>
+          <inertial pos="-7.89219634561439E-05 0.00097321984233115 0.0112167692179996" mass="0.00382855237153465" fullinertia="3.99488238110434E-07 4.00190012613912E-07 6.93581584914543E-08 -1.85363448432404E-10 -4.12189120722601E-10 5.18765070283196E-08"/>
+
+          <!--
+            finger43_link: 无名指橡胶垫
+            无关节，完全固连到 finger42_link，随 PIP 一同运动
+          -->
+          <body name="finger43_link" pos="0 0 0" euler="0 0 0">
+            <geom name="finger43_link" type="mesh" mesh="finger43_link" rgba="0.2 0.2 0.2 1" contype="1" conaffinity="1"/>
+            <inertial pos="0.000145172504775415 -0.00439620819878777 0.019822139983784" mass="0.00194917989840034" fullinertia="9.24793211748131E-08 9.37057773401234E-08 3.12581553687104E-08 -2.25304567561179E-11 -1.15239273424032E-09 2.34518680404736E-08"/>
+          </body>
+
+        </body>
+      </body>
+
+      <!-- ===== 手指 5：小拇指 (Pinky) ===== -->
+
+      <!--
+        finger51: 主动 — 小拇指 MCP
+        绕 +X 轴，范围 0~1.291 rad，独立执行器驱动
+      -->
+      <body name="finger51_link" pos="-0.0263133099109462 0.00562794981638235 0.0830420444966198" euler="0.153405557961376 -0.116668550344774 0.149285285649185">
+        <joint name="finger51" axis="1 0 0" range="0 1.291"/>
+        <geom name="finger51_link" type="mesh" mesh="finger51_link" rgba="0.9 0.9 0.9 1"/>
+        <inertial pos="-2.33333913605971E-06 0.00181485062221548 0.0131392699022088" mass="0.00345037170327943" fullinertia="2.37940412354949E-07 2.69111254422569E-07 1.35191102489079E-07 -3.80727108476698E-12 8.69321923902387E-11 7.24144543213933E-09"/>
+
+        <!--
+          finger52: 从动 — 小拇指 PIP
+          绕 +X 轴，由 equality 约束跟随 finger51 (MCP)
+          原始公式(°): y = 0.0075x² + 0.7349x + 2.0181
+          polycoef(rad): [0.035218, 0.7349, 0.429718, 0, 0]
+        -->
+        <body name="finger52_link" pos="0 0 0.0250241718362191" euler="0 0 0">
+          <joint name="finger52" axis="1 0 0" range="0 1.75"/>
+          <geom name="finger52_link" type="mesh" mesh="finger52_link" rgba="0.9 0.9 0.9 1" contype="1" conaffinity="1"/>
+          <inertial pos="-3.15300649285088E-05 0.00108071309102561 0.00848073574589434" mass="0.0034586827978682" fullinertia="2.5318219393825E-07 2.54247652609832E-07 6.41400708772532E-08 -5.26062638639635E-11 1.06905539796088E-09 2.38936859610866E-08"/>
+
+          <!--
+            finger53_link: 小拇指橡胶垫
+            无关节，完全固连到 finger52_link，随 PIP 一同运动
+          -->
+          <body name="finger53_link" pos="0 0 0" euler="0 0 0">
+            <geom name="finger53_link" type="mesh" mesh="finger53_link" rgba="0.2 0.2 0.2 1" contype="1" conaffinity="1"/>
+            <inertial pos="-0.00010159715941721 -0.00420240434545652 0.0167623091483986" mass="0.00149578721592064" fullinertia="4.39306653069545E-08 4.56160148535183E-08 2.11073455747021E-08 5.60547792622162E-11 -2.47230752349555E-10 1.05043396073308E-08"/>
+          </body>
+
+        </body>
+      </body>
+
+    </body>
+  </worldbody>
+
+  <!-- ==================== 主从关节联动约束 ====================
+    MuJoCo polycoef 语法:
+      joint1(从动) = c[0] + c[1]*joint2(主动) + c[2]*joint2² + c[3]*joint2³ + c[4]*joint2⁴
+
+    单位换算 (原始公式为角度°，MuJoCo 内部用弧度 rad):
+      y_deg = C0 + C1*x_deg + C2*x_deg²
+      c[0] = C0 × (π/180)
+      c[1] = C1
+      c[2] = C2 × (180/π)
+
+    ┌──────────┬──────────────────────────────────────────────────────────┐
+    │ 手指     │ 原始公式 (°)                  → polycoef (rad)          │
+    ├──────────┼──────────────────────────────────────────────────────────┤
+    │ 大拇指   │ -0.0008x²+0.929x-0.8639  → -0.015082 0.929 -0.045837   │
+    │ 食指     │  0.0067x²+0.8847x+2.1926 →  0.038265 0.8847  0.383882  │
+    │ 中指     │  0.0076x²+0.8485x+2.0597 →  0.035946 0.8485  0.435448  │
+    │ 无名指   │  0.0079x²+0.8321x+2.4732 →  0.043170 0.8321  0.452637  │
+    │ 小拇指   │  0.0075x²+0.7349x+2.0181 →  0.035218 0.7349  0.429718  │
+    └──────────┴──────────────────────────────────────────────────────────┘
+  ======================================================== -->
+  <equality>
+    <!-- 大拇指 IP (finger13, 从动) 跟随 MCP flexion (finger12, 主动) -->
+    <joint name="eq_thumb" joint1="finger13" joint2="finger12" polycoef="-0.015082 0.929 -0.045837 0 0"/>
+
+    <!-- 食指 PIP (finger22, 从动) 跟随 MCP (finger21, 主动) -->
+    <joint name="eq_index" joint1="finger22" joint2="finger21" polycoef="0.038265 0.8847 0.383882 0 0"/>
+
+    <!-- 中指 PIP (finger32, 从动) 跟随 MCP (finger31, 主动) -->
+    <joint name="eq_middle" joint1="finger32" joint2="finger31" polycoef="0.035946 0.8485 0.435448 0 0"/>
+
+    <!-- 无名指 PIP (finger42, 从动) 跟随 MCP (finger41, 主动) -->
+    <joint name="eq_ring" joint1="finger42" joint2="finger41" polycoef="0.043170 0.8321 0.452637 0 0"/>
+
+    <!-- 小拇指 PIP (finger52, 从动) 跟随 MCP (finger51, 主动) -->
+    <joint name="eq_pinky" joint1="finger52" joint2="finger51" polycoef="0.035218 0.7349 0.429718 0 0"/>
+  </equality>
+
+  <!-- ==================== 执行器（6 个主动自由度）====================
+    仅对主动关节添加执行器，从动关节 (finger13/22/32/42/52) 由 equality
+    自动驱动，橡胶垫固连体无需执行器。
+    kp=50  : 位置刚度（弹簧）
+    kv=2.0 : 速度阻尼（速度反馈，与 joint damping 共同决定阻尼比）
+    阻尼比 ζ = (kv + damping) / (2√(kp × armature))
+             = (2.0 + 2.0) / (2√(50 × 0.01)) ≈ 2.83  → 过阻尼，无摇晃
+  ======================================================== -->
+  <actuator>
+    <!-- 大拇指: 2 个主动 DOF -->
+    <position name="act_finger11" joint="finger11" kp="50" kv="2.0" ctrlrange="0 1.588"/>
+    <position name="act_finger12" joint="finger12" kp="50" kv="2.0" ctrlrange="0 1.030"/>
+
+    <!-- 食指: 1 个主动 DOF (PIP 由 equality 驱动) -->
+    <position name="act_finger21" joint="finger21" kp="50" kv="2.0" ctrlrange="0 1.257"/>
+
+    <!-- 中指: 1 个主动 DOF -->
+    <position name="act_finger31" joint="finger31" kp="50" kv="2.0" ctrlrange="0 1.257"/>
+
+    <!-- 无名指: 1 个主动 DOF -->
+    <position name="act_finger41" joint="finger41" kp="50" kv="2.0" ctrlrange="0 1.257"/>
+
+    <!-- 小拇指: 1 个主动 DOF -->
+    <position name="act_finger51" joint="finger51" kp="50" kv="2.0" ctrlrange="0 1.291"/>
+  </actuator>
+
+</mujoco>

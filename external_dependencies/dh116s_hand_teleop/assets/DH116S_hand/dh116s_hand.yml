@@ -1,0 +1,40 @@
+left:
+  type: dexpilot
+  urdf_path: DH116S_hand/DH116S-L000-A1/urdf/DH116S-L000-A1.urdf
+
+  # 6 active motor joints (coupled joints handled by URDF mimic tags)
+  target_joint_names:
+    [
+      'finger11',   # thumb abduction
+      'finger12',   # thumb flexion
+      'finger21',   # index flexion
+      'finger31',   # middle flexion
+      'finger41',   # ring flexion
+      'finger51',   # pinky flexion
+    ]
+
+  wrist_link_name: "base_link"
+  finger_tip_link_names: [ "finger1_tip", "finger2_tip", "finger3_tip", "finger4_tip", "finger5_tip" ]
+
+  scaling_factor: 1.0
+  low_pass_alpha: 0.10
+
+right:
+  type: dexpilot
+  urdf_path: DH116S_hand/DH116S-R000-A1/urdf/DH116S-R000-A1.urdf
+
+  target_joint_names:
+    [
+      'finger11',   # thumb abduction
+      'finger12',   # thumb flexion
+      'finger21',   # index flexion
+      'finger31',   # middle flexion
+      'finger41',   # ring flexion
+      'finger51',   # pinky flexion
+    ]
+
+  wrist_link_name: "base_link"
+  finger_tip_link_names: [ "finger1_tip", "finger2_tip", "finger3_tip", "finger4_tip", "finger5_tip" ]
+
+  scaling_factor: 1.0
+  low_pass_alpha: 0.10
