@@ -31,6 +31,7 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py --sim        # MuJoCo sim
     python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer  # skip viewer
     python gear_sonic/scripts/launch_data_collection.py --pico-hand-mode fourier_trigger
+    python gear_sonic/scripts/launch_data_collection.py --pico-hand-mode dh116s_trigger --dh116s-hand-dir double
 """
 
 from dataclasses import dataclass
@@ -118,8 +119,29 @@ class DataCollectionLaunchConfig:
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
 
-    pico_hand_mode: Literal["trigger", "fourier", "fourier_trigger"] = "trigger"
+    pico_hand_mode: Literal["trigger", "fourier", "fourier_trigger", "dh116s", "dh116s_trigger"] = "trigger"
     """Hand mode forwarded to pico_manager_thread_server --hand_mode."""
+
+    dh116s_hand_dir: Literal["left", "right", "double"] = "left"
+    """Physical DH116S hand side forwarded to --dh116s_hand_dir."""
+
+    dh116s_node_id: int = 1
+    """Left/single DH116S CANFD node ID forwarded to --dh116s_node_id."""
+
+    dh116s_right_node_id: int = 9
+    """Right DH116S CANFD node ID forwarded to --dh116s_right_node_id."""
+
+    dh116s_current: int = 800
+    """DH116S max current in permille forwarded to --dh116s_current."""
+
+    dh116s_home_wait_time: float = 2.0
+    """Seconds to wait after DH116S homing forwarded to --dh116s_home_wait_time."""
+
+    dh116s_sim: bool = False
+    """Run DH116S hand control without sending hardware SDK commands."""
+
+    dh116s_debug: bool = False
+    """Log periodic DH116S hand control debug output."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
@@ -298,6 +320,14 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PICO hand mode:  {config.pico_hand_mode}")
+    if config.pico_hand_mode.startswith("dh116s"):
+        print(
+            "  DH116S:          "
+            f"hand_dir={config.dh116s_hand_dir} "
+            f"left_node={config.dh116s_node_id} "
+            f"right_node={config.dh116s_right_node_id} "
+            f"sim={config.dh116s_sim} debug={config.dh116s_debug}"
+        )
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print("=" * 60)
@@ -364,6 +394,16 @@ def main(config: DataCollectionLaunchConfig):
     if config.pico_manager:
         pico_cmd += " --manager"
     pico_cmd += f" --hand_mode {config.pico_hand_mode}"
+    if config.pico_hand_mode.startswith("dh116s"):
+        pico_cmd += f" --dh116s_hand_dir {config.dh116s_hand_dir}"
+        pico_cmd += f" --dh116s_node_id {config.dh116s_node_id}"
+        pico_cmd += f" --dh116s_right_node_id {config.dh116s_right_node_id}"
+        pico_cmd += f" --dh116s_current {config.dh116s_current}"
+        pico_cmd += f" --dh116s_home_wait_time {config.dh116s_home_wait_time}"
+        if config.dh116s_sim:
+            pico_cmd += " --dh116s_sim"
+        if config.dh116s_debug:
+            pico_cmd += " --dh116s_debug"
     if config.pico_vis_vr3pt:
         pico_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
