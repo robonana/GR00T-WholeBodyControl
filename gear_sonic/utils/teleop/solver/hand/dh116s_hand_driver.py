@@ -52,7 +52,13 @@ JOINT_RAD_RANGES = [
     (0.0, 1.291),
 ]
 
-DH116S_TRIGGER_CLOSE_Q = np.array([limit[1] for limit in JOINT_RAD_RANGES], dtype=np.float32)
+# Per-joint max closure ratio (1.0 = full range). Thumb abd uses full range,
+# remaining joints limited to 40% to prevent over-closure in trigger mode.
+DH116S_TRIGGER_CLOSE_RATIOS = np.array([1.0, 0.4, 0.4, 0.4, 0.4, 0.4], dtype=np.float32)
+DH116S_TRIGGER_CLOSE_Q = np.array(
+    [limit[1] * r for limit, r in zip(JOINT_RAD_RANGES, DH116S_TRIGGER_CLOSE_RATIOS)],
+    dtype=np.float32,
+)
 
 
 def _tracking_valid(hand: np.ndarray, side: str) -> bool:
