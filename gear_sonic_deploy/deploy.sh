@@ -382,8 +382,11 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # Additional flags for simulation mode
 EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
-    EXTRA_ARGS="--disable-crc-check"
-    echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
+    # --no-hands: in sim, hand commands come from an external streamer
+    # (dummy_vr_streamer/dummy_hand_streamer) on rt/dex3/cmd. Without this the
+    # deploy would also publish zeros on that topic and fight the streamer.
+    EXTRA_ARGS="--disable-crc-check --no-hands"
+    echo -e "${YELLOW}📋 Simulation mode: CRC check disabled; hand publishing off (--no-hands, hands come from the replay streamer)${NC}"
     echo ""
 fi
 

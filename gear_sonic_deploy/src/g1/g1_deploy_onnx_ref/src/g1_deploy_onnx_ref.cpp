@@ -248,6 +248,10 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+    // When false (--no-hands), the deploy never initializes or publishes the Dex3
+    // hand channel (rt/dex3/cmd). Used in sim so an external hand streamer can own
+    // that channel without the deploy's zero commands contending with it.
+    bool publish_hands_ = true;
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -2156,7 +2160,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool publish_hands = true)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2167,6 +2172,7 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
+        publish_hands_(publish_hands),
         program_state_(ProgramState::INIT),
         last_action {0.0},
         last_left_hand_action {0.0},
@@ -2181,8 +2187,12 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // Initialize Dex3 hands (ChannelFactory already initialized above).
+      // Skipped under --no-hands so the deploy never creates the rt/dex3/cmd
+      // publisher (an external hand streamer owns that channel in sim).
+      if (publish_hands_) {
+        dex3_hands_.initialize("");
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2676,7 +2686,9 @@ class G1Deploy {
       }
 
       // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (publish_hands_) {
+        dex3_hands_.writeOnce();
+      }
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -4177,10 +4189,14 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool publishHands = true; // --no-hands disables the deploy's Dex3/rt/dex3 publishing
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--no-hands") {
+      publishHands = false;
+      std::cout << "[INFO] Hand (Dex3 rt/dex3/cmd) publishing disabled (--no-hands)" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4438,7 +4454,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    publishHands
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

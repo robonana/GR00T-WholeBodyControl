@@ -247,6 +247,23 @@ class DefaultEnv:
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
 
+        # Map each commanded joint id to its actuator index. We cannot assume
+        # actuator_index == joint_id - 1: hands with mechanical coupling (e.g. the
+        # Fourier/Inspire 6-DoF hands) carry extra mimic joints that have no actuator,
+        # so the actuator order no longer mirrors the joint order. For the Dex3 model
+        # this map is the identity (actuator i drives joint i+1), so it is backwards
+        # compatible.
+        joint_to_act = {}
+        for a in range(self.mj_model.nu):
+            joint_to_act[int(self.mj_model.actuator_trnid[a, 0])] = a
+        self.body_act_index = np.array([joint_to_act[int(j)] for j in self.body_joint_index])
+        self.left_hand_act_index = np.array(
+            [joint_to_act[int(j)] for j in self.left_hand_index], dtype=int
+        )
+        self.right_hand_act_index = np.array(
+            [joint_to_act[int(j)] for j in self.right_hand_index], dtype=int
+        )
+
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -373,16 +390,16 @@ class DefaultEnv:
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_act_index]
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_act_index]
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_act_index]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -414,11 +431,12 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        # Scatter PD torques into the actuator-ordered ctrl vector via the
+        # joint -> actuator map (see __init__; handles coupled hand joints).
+        self.torques[self.body_act_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_act_index] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_act_index] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
