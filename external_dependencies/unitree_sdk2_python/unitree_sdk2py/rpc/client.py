@@ -63,6 +63,13 @@ class Client(ClientBase):
         else:
             return RPC_ERR_CLIENT_API_NOT_REG, None
 
+    def _CallBinaryWithParameter(self, apiId: int, parameter: str, binary: list):
+        ret, proirity, leaseId = self.__CheckApi(apiId)
+        if ret == 0:
+            return self._CallBinaryWithParameterBase(apiId, parameter, binary, proirity, leaseId)
+        else:
+            return RPC_ERR_CLIENT_API_NOT_REG, None
+
     def _CallBinaryNoReply(self, apiId: int, parameter: list):
         ret, proirity, leaseId = self.__CheckApi(apiId)
         if ret == 0:

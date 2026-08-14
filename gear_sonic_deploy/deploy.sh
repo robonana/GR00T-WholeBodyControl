@@ -211,6 +211,8 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --zmq-out-port PORT     Set the ZMQ state output port (default: 5557)"
+    echo "  --disable-hands         Disable Dex3 hand control (for external hand drivers)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -251,6 +253,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+EXTRA_ARGS=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -314,6 +317,18 @@ while [[ $# -gt 0 ]]; do
             fi
             ZMQ_HOST="$2"
             shift 2
+            ;;
+        --zmq-out-port)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --zmq-out-port requires a port argument${NC}" >&2
+                exit 1
+            fi
+            EXTRA_ARGS="$EXTRA_ARGS --zmq-out-port $2"
+            shift 2
+            ;;
+        --disable-hands)
+            EXTRA_ARGS="$EXTRA_ARGS --disable-hands"
+            shift
             ;;
         sim|real)
             INTERFACE_MODE="$1"
@@ -380,13 +395,9 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
-EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
-    # --no-hands: in sim, hand commands come from an external streamer
-    # (dummy_vr_streamer/dummy_hand_streamer) on rt/dex3/cmd. Without this the
-    # deploy would also publish zeros on that topic and fight the streamer.
-    EXTRA_ARGS="--disable-crc-check --no-hands"
-    echo -e "${YELLOW}📋 Simulation mode: CRC check disabled; hand publishing off (--no-hands, hands come from the replay streamer)${NC}"
+    EXTRA_ARGS="$EXTRA_ARGS --disable-crc-check"
+    echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi
 

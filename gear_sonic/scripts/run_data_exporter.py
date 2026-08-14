@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import time
+from typing import Literal
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -71,6 +72,12 @@ class SonicDataExporterConfig:
     data_collection_frequency: int = 50
     """Data collection frequency (Hz)."""
 
+    video_crf: int = 18
+    """H.264 quality for saved dataset videos. Lower is clearer; 18 is visually near-lossless."""
+
+    video_preset: str = "veryfast"
+    """H.264 encoder preset. veryfast reduces CPU load while recording three cameras."""
+
 
     # Camera
     camera_host: str = "localhost"
@@ -103,6 +110,18 @@ class SonicDataExporterConfig:
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
+    text_to_speech_backend: Literal["robot", "local", "both"] = "robot"
+    """Voice feedback backend: robot speaker, local espeak, or both."""
+
+    robot_tts_network_interface: str = ""
+    """Robot DDS network interface for G1 speaker TTS. Empty = auto-detect 192.168.123.x."""
+
+    robot_tts_volume: int = 100
+    """Robot speaker volume for G1 AudioClient."""
+
+    robot_tts_speaker_id: int = 0
+    """Robot TTS speaker ID passed to G1 AudioClient.TtsMaker."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,9 +139,9 @@ class TimeDeltaException(Exception):
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
     """Unpack a single-frame packed message from pico_manager_thread_server.
 
-    Wire format: [topic_prefix][1280-byte JSON header][concatenated binary fields]
+    Wire format: [topic_prefix][2048-byte JSON header][concatenated binary fields]
     """
-    HEADER_SIZE = 1280
+    HEADER_SIZE = 2048
 
     topic_bytes = topic.encode("utf-8")
     if not packed_data.startswith(topic_bytes):
@@ -244,7 +263,6 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
-        self.latest_fourier_state_msg = None
         self.latest_dh116s_state_msg = None
 
         self.current_stream_mode = 0
@@ -269,11 +287,10 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "fourier_state")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "dh116s_state")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            print("[Sonic] Subscribed to: pose, planner, manager_state, fourier_state, dh116s_state")
+            print("[Sonic] Subscribed to: pose, planner, manager_state, dh116s_state")
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
@@ -292,9 +309,22 @@ class GrootDataCollector:
     def current_episode_index(self):
         return self.data_exporter.episode_buffer["episode_index"]
 
-    def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
+    def _print_and_say(
+        self,
+        message: str,
+        say: bool = True,
+        blocking: bool = False,
+        priority: str = "recording",
+        expires_after_s: float | None = None,
+    ):
         if self.text_to_speech is not None:
-            self.text_to_speech.print_and_say(message, say, blocking=blocking)
+            self.text_to_speech.print_and_say(
+                message,
+                say,
+                blocking=blocking,
+                priority=priority,
+                expires_after_s=expires_after_s,
+            )
         else:
             print(message)
 
@@ -325,18 +355,29 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
                 self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
+                    f"开始记录第 {self.current_episode_index} 条数据",
+                    blocking=False,
+                    priority="recording",
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+                self._print_and_say(
+                    "停止记录，正在保存", blocking=False, priority="recording"
+                )
             elif self._episode_state.get_state() == self._episode_state.IDLE:
-                self._print_and_say("Saved episode and back to idle state", blocking=False)
+                self._print_and_say(
+                    "已保存，回到空闲状态",
+                    blocking=False,
+                    priority="status",
+                    expires_after_s=3.0,
+                )
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
+                self._print_and_say(
+                    "已丢弃本条数据", blocking=False, priority="critical"
+                )
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -352,8 +393,6 @@ class GrootDataCollector:
 
             if raw.startswith(b"manager_state"):
                 self._handle_manager_state(raw)
-            elif raw.startswith(b"fourier_state"):
-                self._handle_fourier_state(raw)
             elif raw.startswith(b"dh116s_state"):
                 self._handle_dh116s_state(raw)
             elif raw.startswith(b"planner"):
@@ -374,22 +413,6 @@ class GrootDataCollector:
             self._manager_toggle_dc = True
         if self._extract_bool(data, "toggle_data_abort"):
             self._manager_toggle_da = True
-
-    def _handle_fourier_state(self, raw: bytes) -> None:
-        try:
-            data = unpack_pose_message(raw, topic="fourier_state")
-        except Exception:
-            return
-
-        self.latest_fourier_state_msg = {
-            "left_hand_fourier_actual_joints": self._extract_optional_vector(
-                data, "left_hand_fourier_actual_joints", 6
-            ),
-            "right_hand_fourier_actual_joints": self._extract_optional_vector(
-                data, "right_hand_fourier_actual_joints", 6
-            ),
-            "receive_timestamp": time.time(),
-        }
 
     def _handle_dh116s_state(self, raw: bytes) -> None:
         try:
@@ -444,18 +467,6 @@ class GrootDataCollector:
             "vr_3pt_orientation": vr_3pt_orientation,
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
-            "left_hand_fourier_joints": self._extract_optional_vector(
-                data, "left_hand_fourier_joints", 6
-            ),
-            "right_hand_fourier_joints": self._extract_optional_vector(
-                data, "right_hand_fourier_joints", 6
-            ),
-            "left_hand_fourier_actual_joints": self._extract_optional_vector(
-                data, "left_hand_fourier_actual_joints", 6
-            ),
-            "right_hand_fourier_actual_joints": self._extract_optional_vector(
-                data, "right_hand_fourier_actual_joints", 6
-            ),
             "left_hand_dh116s_joints": self._extract_optional_vector(
                 data, "left_hand_dh116s_joints", 6
             ),
@@ -542,18 +553,6 @@ class GrootDataCollector:
                 ),
                 "left_hand_joints": left_hand_joints,
                 "right_hand_joints": right_hand_joints,
-                "left_hand_fourier_joints": self._extract_optional_vector(
-                    pose_data, "left_hand_fourier_joints", 6
-                ),
-                "right_hand_fourier_joints": self._extract_optional_vector(
-                    pose_data, "right_hand_fourier_joints", 6
-                ),
-                "left_hand_fourier_actual_joints": self._extract_optional_vector(
-                    pose_data, "left_hand_fourier_actual_joints", 6
-                ),
-                "right_hand_fourier_actual_joints": self._extract_optional_vector(
-                    pose_data, "right_hand_fourier_actual_joints", 6
-                ),
                 "left_hand_dh116s_joints": self._extract_optional_vector(
                     pose_data, "left_hand_dh116s_joints", 6
                 ),
@@ -590,13 +589,17 @@ class GrootDataCollector:
         return np.zeros(7, dtype=np.float32)
 
     @staticmethod
-    def _extract_optional_vector(pose_data: dict, key: str, size: int) -> np.ndarray:
+    def _extract_optional_vector(pose_data: dict, key: str, size: int) -> np.ndarray | None:
         arr = pose_data.get(key)
-        if arr is not None:
-            if arr.ndim > 1:
-                arr = arr[0]
-            return arr.astype(np.float32)
-        return np.zeros(size, dtype=np.float32)
+        if arr is None:
+            return None
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr[0]
+        arr = arr.reshape(-1)
+        if arr.size != size:
+            return None
+        return arr.astype(np.float32)
 
     @staticmethod
     def _extract_bool(pose_data: dict, key: str) -> bool:
@@ -645,7 +648,9 @@ class GrootDataCollector:
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
-                self._print_and_say("Finished saving episode")
+                self._print_and_say(
+                    "保存完成", priority="status", expires_after_s=3.0
+                )
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
@@ -701,6 +706,28 @@ class GrootDataCollector:
             "action.wbc": whole_action_wbc,
         }
 
+        # Preserve encoder velocities in the same full-robot joint layout as
+        # observation.state. These are required for tracking and torque
+        # diagnostics, but were previously dropped by the Python exporter.
+        body_dq = np.asarray(
+            proprio.get("body_dq", np.zeros(29)), dtype=np.float64
+        )
+        left_hand_dq = np.asarray(
+            proprio.get("left_hand_dq", np.zeros(7)), dtype=np.float64
+        )
+        right_hand_dq = np.asarray(
+            proprio.get("right_hand_dq", np.zeros(7)), dtype=np.float64
+        )
+        self._add_if_supported(
+            frame_data,
+            "observation.velocity",
+            self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=body_dq,
+                left_hand_actuated_joint_values=left_hand_dq,
+                right_hand_actuated_joint_values=right_hand_dq,
+            ),
+        )
+
         self._add_cpp_state_features(frame_data, proprio)
 
         sonic_latency_ms = self._add_sonic_pose_features(frame_data)
@@ -711,6 +738,16 @@ class GrootDataCollector:
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
+
+    def _add_if_supported(self, frame_data: dict, key: str, value) -> None:
+        """Add a migrated feature while remaining compatible with old datasets.
+
+        Existing datasets keep the feature schema stored in meta/info.json.
+        Silently omitting newly introduced diagnostics lets those datasets be
+        resumed without weakening validation for newly created datasets.
+        """
+        if key in self.data_exporter.features:
+            frame_data[key] = value
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -760,6 +797,74 @@ class GrootDataCollector:
             frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+
+        self._add_if_supported(
+            frame_data,
+            "observation.base_ang_vel",
+            np.asarray(proprio.get("base_ang_vel", np.zeros(3)), dtype=np.float64),
+        )
+        self._add_if_supported(
+            frame_data,
+            "observation.torso_orientation",
+            np.asarray(
+                proprio.get(
+                    "body_torso_quat", np.array([1.0, 0.0, 0.0, 0.0])
+                ),
+                dtype=np.float64,
+            ),
+        )
+        self._add_if_supported(
+            frame_data,
+            "observation.torso_ang_vel",
+            np.asarray(
+                proprio.get("body_torso_ang_vel", np.zeros(3)), dtype=np.float64
+            ),
+        )
+
+        raw_temperature = proprio.get("motor_temperature")
+        temperatures = (
+            np.asarray(raw_temperature, dtype=np.float64).reshape(-1)
+            if raw_temperature is not None
+            else np.empty(0, dtype=np.float64)
+        )
+        if temperatures.size == 58:
+            # The C++ publisher sends two sensors per body motor. Keep the
+            # hotter reading so alarms cannot be hidden by sensor ordering.
+            temperatures = np.maximum(temperatures[0::2], temperatures[1::2])
+        elif temperatures.size != 29:
+            temperatures = np.zeros(29, dtype=np.float64)
+        self._add_if_supported(
+            frame_data, "observation.motor_temperature", temperatures
+        )
+
+        # Keep the combined visualizer fields in the dataset as diagnostics.
+        # The remote C++ publisher already emits these on g1_debug.
+        self._add_if_supported(
+            frame_data,
+            "debug.body_q_target",
+            np.asarray(proprio.get("body_q_target", np.zeros(29)), dtype=np.float64),
+        )
+        self._add_if_supported(
+            frame_data,
+            "debug.body_q_measured",
+            np.asarray(
+                proprio.get("body_q_measured", np.zeros(29)), dtype=np.float64
+            ),
+        )
+        self._add_if_supported(
+            frame_data,
+            "debug.base_trans_target",
+            np.asarray(
+                proprio.get("base_trans_target", np.zeros(3)), dtype=np.float64
+            ),
+        )
+        self._add_if_supported(
+            frame_data,
+            "debug.base_trans_measured",
+            np.asarray(
+                proprio.get("base_trans_measured", np.zeros(3)), dtype=np.float64
+            ),
+        )
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -862,18 +967,6 @@ class GrootDataCollector:
             and hand_msg.get("right_hand_joints") is not None
             else np.zeros(7, dtype=np.float32)
         )
-        frame_data["teleop.left_hand_fourier_joints"] = (
-            hand_msg["left_hand_fourier_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("left_hand_fourier_joints") is not None
-            else np.zeros(6, dtype=np.float32)
-        )
-        frame_data["teleop.right_hand_fourier_joints"] = (
-            hand_msg["right_hand_fourier_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("right_hand_fourier_joints") is not None
-            else np.zeros(6, dtype=np.float32)
-        )
         frame_data["teleop.left_hand_dh116s_joints"] = (
             hand_msg["left_hand_dh116s_joints"].astype(np.float32)
             if hand_msg is not None
@@ -884,25 +977,6 @@ class GrootDataCollector:
             hand_msg["right_hand_dh116s_joints"].astype(np.float32)
             if hand_msg is not None
             and hand_msg.get("right_hand_dh116s_joints") is not None
-            else np.zeros(6, dtype=np.float32)
-        )
-
-        fourier_state_msg = self.latest_fourier_state_msg
-        use_fourier_state = False
-        if fourier_state_msg is not None:
-            receive_ts = fourier_state_msg.get("receive_timestamp")
-            use_fourier_state = receive_ts is None or (time.time() - receive_ts) <= 0.5
-        fourier_actual_msg = fourier_state_msg if use_fourier_state else hand_msg
-        frame_data["observation.left_hand_fourier_actual_joints"] = (
-            fourier_actual_msg["left_hand_fourier_actual_joints"].astype(np.float32)
-            if fourier_actual_msg is not None
-            and fourier_actual_msg.get("left_hand_fourier_actual_joints") is not None
-            else np.zeros(6, dtype=np.float32)
-        )
-        frame_data["observation.right_hand_fourier_actual_joints"] = (
-            fourier_actual_msg["right_hand_fourier_actual_joints"].astype(np.float32)
-            if fourier_actual_msg is not None
-            and fourier_actual_msg.get("right_hand_fourier_actual_joints") is not None
             else np.zeros(6, dtype=np.float32)
         )
 
@@ -989,15 +1063,19 @@ class GrootDataCollector:
 
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
+            self._print_and_say(
+                "正在结束数据采集", blocking=False, priority="critical"
+            )
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
                 self.data_exporter.save_episode()
             self._print_and_say(
-                f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
+                f"数据采集结束：{self.data_exporter.meta.root}", say=False, blocking=True
             )
         except Exception as e:
-            self._print_and_say(f"Error saving episode: {e}", blocking=True)
+            self._print_and_say(
+                f"保存数据出错：{e}", blocking=True, priority="critical"
+            )
 
         try:
             self._state_subscriber.close()
@@ -1083,7 +1161,16 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
-    text_to_speech = TextToSpeech() if config.text_to_speech else None
+    text_to_speech = (
+        TextToSpeech(
+            backend=config.text_to_speech_backend,
+            robot_network_interface=config.robot_tts_network_interface,
+            robot_volume=config.robot_tts_volume,
+            robot_speaker_id=config.robot_tts_speaker_id,
+        )
+        if config.text_to_speech
+        else None
+    )
 
     robot_config = poll_robot_config_zmq(
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
@@ -1095,7 +1182,14 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "video_crf": config.video_crf,
+            "video_preset": config.video_preset,
+        },
+        video_crf=config.video_crf,
+        video_preset=config.video_preset,
     )
 
     data_collector = GrootDataCollector(

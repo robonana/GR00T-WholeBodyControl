@@ -1,6 +1,6 @@
 """Builders for ZMQ wire-format messages on the 'command', 'planner', and 'pose' topics.
 
-Message layout: [topic_bytes][1024-byte JSON header][packed binary payload].
+Message layout: [topic_bytes][2048-byte JSON header][packed binary payload].
 The header describes field names, dtypes, and shapes so the receiver can
 deserialize without out-of-band schema knowledge.
 """
@@ -11,7 +11,7 @@ from typing import Sequence
 
 import numpy as np
 
-HEADER_SIZE = 1280
+HEADER_SIZE = 2048
 
 
 def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
@@ -71,10 +71,6 @@ def build_planner_message(
     upper_body_velocity: Sequence[float] | None = None,
     left_hand_position: Sequence[float] | None = None,
     right_hand_position: Sequence[float] | None = None,
-    left_hand_fourier_position: Sequence[float] | None = None,
-    right_hand_fourier_position: Sequence[float] | None = None,
-    left_hand_fourier_actual_position: Sequence[float] | None = None,
-    right_hand_fourier_actual_position: Sequence[float] | None = None,
     left_hand_dh116s_position: Sequence[float] | None = None,
     right_hand_dh116s_position: Sequence[float] | None = None,
     left_hand_dh116s_actual_position: Sequence[float] | None = None,
@@ -142,50 +138,6 @@ def build_planner_message(
             {"name": "right_hand_joints", "dtype": "f32", "shape": [len(right_hand_position)]}
         )
         for value in right_hand_position:
-            payload += struct.pack("<f", float(value))
-
-    if left_hand_fourier_position is not None:
-        fields.append(
-            {
-                "name": "left_hand_fourier_joints",
-                "dtype": "f32",
-                "shape": [len(left_hand_fourier_position)],
-            }
-        )
-        for value in left_hand_fourier_position:
-            payload += struct.pack("<f", float(value))
-
-    if right_hand_fourier_position is not None:
-        fields.append(
-            {
-                "name": "right_hand_fourier_joints",
-                "dtype": "f32",
-                "shape": [len(right_hand_fourier_position)],
-            }
-        )
-        for value in right_hand_fourier_position:
-            payload += struct.pack("<f", float(value))
-
-    if left_hand_fourier_actual_position is not None:
-        fields.append(
-            {
-                "name": "left_hand_fourier_actual_joints",
-                "dtype": "f32",
-                "shape": [len(left_hand_fourier_actual_position)],
-            }
-        )
-        for value in left_hand_fourier_actual_position:
-            payload += struct.pack("<f", float(value))
-
-    if right_hand_fourier_actual_position is not None:
-        fields.append(
-            {
-                "name": "right_hand_fourier_actual_joints",
-                "dtype": "f32",
-                "shape": [len(right_hand_fourier_actual_position)],
-            }
-        )
-        for value in right_hand_fourier_actual_position:
             payload += struct.pack("<f", float(value))
 
     if left_hand_dh116s_position is not None:
@@ -257,7 +209,7 @@ def build_planner_message(
 def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) -> bytes:
     """
     Pack pose/action data into ZMQ message format:
-    [topic_prefix][1024-byte JSON header][concatenated binary fields]
+    [topic_prefix][2048-byte JSON header][concatenated binary fields]
 
     This is a general-purpose function for packing numpy arrays into ZMQ messages.
     Supports protocol versions 3 and 4.
@@ -312,7 +264,7 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
     # Build header using common utility
     header_bytes = _build_header(fields, version=version, count=1)
 
-    # Pack message: [topic][1024-byte header][binary data]
+    # Pack message: [topic][2048-byte header][binary data]
     topic_bytes = topic.encode("utf-8")
     data_bytes = b"".join(binary_data)
 

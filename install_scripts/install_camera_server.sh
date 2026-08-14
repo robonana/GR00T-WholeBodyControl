@@ -5,7 +5,8 @@
 #
 # Installs gear_sonic[camera] which includes the ZMQ-based camera server
 # framework and the depthai SDK (OAK cameras). For other camera SDKs
-# (e.g. pyrealsense2), install them into the venv after setup.
+# (e.g. pyrealsense2), install them into the venv after setup. The Unitree
+# SV1-25 uses install_sv1_camera_sdk.sh to build its native unlock helper.
 #
 # Usage:  bash install_scripts/install_camera_server.sh   (run from repo root)
 
@@ -68,8 +69,9 @@ echo ""
 echo "  Activate the venv with:"
 echo "    source .venv_camera/bin/activate"
 echo ""
-echo "  For other camera SDKs, install into the venv:"
+echo "  For other camera SDKs:"
 echo "    pip install pyrealsense2     # Intel RealSense"
+echo "    bash install_scripts/install_sv1_camera_sdk.sh  # Unitree SV1-25"
 echo ""
 echo "  See docs/source/tutorials/data_collection.md for full setup."
 echo "══════════════════════════════════════════════════════════════"
@@ -154,9 +156,16 @@ echo ""
 CAMERA_ARGS=""
 
 # --- Ego-view camera (required) ---
-read -rp "  Ego-view camera type (oak, oak_mono, realsense, usb) [oak]: " EGO_TYPE
+read -rp "  Ego-view camera type (oak, oak_mono, realsense, sv1, usb) [oak]: " EGO_TYPE
 EGO_TYPE="${EGO_TYPE:-oak}"
-read -rp "  Ego-view device ID (MxID or /dev/video index): " EGO_DEVICE_ID
+if [[ "$EGO_TYPE" == "sv1" ]]; then
+    bash "$REPO_ROOT/install_scripts/install_sv1_camera_sdk.sh"
+    DEFAULT_SV1_DEVICE="/dev/v4l/by-id/usb-USB2.0_Camera_RGB_USB2.0_Camera_RGB_01.00.00-video-index0"
+    read -rp "  SV1 device path [$DEFAULT_SV1_DEVICE]: " EGO_DEVICE_ID
+    EGO_DEVICE_ID="${EGO_DEVICE_ID:-$DEFAULT_SV1_DEVICE}"
+else
+    read -rp "  Ego-view device ID (MxID, index, or /dev/v4l path): " EGO_DEVICE_ID
+fi
 CAMERA_ARGS="--ego-view-camera ${EGO_TYPE}"
 if [ -n "$EGO_DEVICE_ID" ]; then
     CAMERA_ARGS="${CAMERA_ARGS} --ego-view-device-id ${EGO_DEVICE_ID}"
@@ -168,7 +177,7 @@ read -rp "  Add a left-wrist camera? [y/N]: " ADD_LEFT
 if [[ "$ADD_LEFT" =~ ^[Yy]$ ]]; then
     read -rp "  Left-wrist camera type [oak]: " LEFT_TYPE
     LEFT_TYPE="${LEFT_TYPE:-oak}"
-    read -rp "  Left-wrist device ID (MxID): " LEFT_DEVICE_ID
+    read -rp "  Left-wrist device ID (MxID, index, or /dev/v4l path): " LEFT_DEVICE_ID
     CAMERA_ARGS="${CAMERA_ARGS} --left-wrist-camera ${LEFT_TYPE}"
     if [ -n "$LEFT_DEVICE_ID" ]; then
         CAMERA_ARGS="${CAMERA_ARGS} --left-wrist-device-id ${LEFT_DEVICE_ID}"
@@ -181,7 +190,7 @@ read -rp "  Add a right-wrist camera? [y/N]: " ADD_RIGHT
 if [[ "$ADD_RIGHT" =~ ^[Yy]$ ]]; then
     read -rp "  Right-wrist camera type [oak]: " RIGHT_TYPE
     RIGHT_TYPE="${RIGHT_TYPE:-oak}"
-    read -rp "  Right-wrist device ID (MxID): " RIGHT_DEVICE_ID
+    read -rp "  Right-wrist device ID (MxID, index, or /dev/v4l path): " RIGHT_DEVICE_ID
     CAMERA_ARGS="${CAMERA_ARGS} --right-wrist-camera ${RIGHT_TYPE}"
     if [ -n "$RIGHT_DEVICE_ID" ]; then
         CAMERA_ARGS="${CAMERA_ARGS} --right-wrist-device-id ${RIGHT_DEVICE_ID}"

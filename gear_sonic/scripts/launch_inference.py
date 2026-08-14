@@ -22,7 +22,7 @@ Prerequisites:
     - tmux installed (sudo apt install tmux)
     - Virtual environments set up:
         bash install_scripts/install_inference.sh     -> .venv_inference
-        bash install_scripts/install_data_collection.sh -> .venv_data_collection (optional, for recording)
+        bash install_scripts/install_data_collection.sh -> .venv_data_collection
     - gear_sonic_deploy built (see docs)
     - Isaac-GR00T PolicyServer running separately
 
@@ -30,11 +30,16 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py                        # real robot
     python gear_sonic/scripts/launch_inference.py --sim                  # MuJoCo sim
     python gear_sonic/scripts/launch_inference.py --no-data-exporter     # no recording pane
+
+DH116S policies normally emit the SONIC canonical 7D left_hand_joints/
+right_hand_joints fields. run_vla_inference.py forwards those canonical fields
+over ZMQ and maps them to 6D DH116S motor targets for the Python sidecar.
 """
 
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -71,6 +76,9 @@ _bootstrap_venv()
 import tyro
 
 
+DATA_COLLECTION_PYTHON = Path(".venv_data_collection/bin/python")
+
+
 def _get_local_ip() -> str:
     """Best-effort detection of the PC's LAN IP address."""
     try:
@@ -97,6 +105,15 @@ class InferenceLaunchConfig:
 
     deploy_zmq_host: str = "localhost"
     """ZMQ host for the C++ deploy to listen on."""
+
+    state_zmq_port: int = 5557
+    """ZMQ state port published by C++ deploy."""
+
+    action_zmq_port: int = 5556
+    """ZMQ action port used by run_vla_inference.py."""
+
+    keyboard_zmq_port: int = 5580
+    """ZMQ keyboard port used by the inline keyboard publisher."""
 
     deploy_checkpoint: str = ""
     """Checkpoint path for deploy.sh. Leave empty for default."""
@@ -132,6 +149,42 @@ class InferenceLaunchConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
 
+    initial_pose_blend_duration: float = 3.0
+    """Seconds to blend from current motion token to the VLA initial pose."""
+
+    hand_type: str = "dex3"
+    """Hand type: 'dex3' (official C++ Dex3 path) or 'dh116s' (Python sidecar)."""
+
+    dh116s_sim_mode: bool = False
+    """Run DH116S sidecar in simulation mode."""
+
+    dh116s_action_scale: float = 1.0
+    """Scale DH116S hand actions for smoothing (0.0-1.0)."""
+
+    dh116s_sdk_dir: str = "~/lhandpro_project"
+    """LHandPro SDK directory."""
+
+    dh116s_left_device_index: int = 1
+    """Left DH116S USB-CANFD device index."""
+
+    dh116s_right_device_index: int = 0
+    """Right DH116S USB-CANFD device index."""
+
+    dh116s_left_node_id: int = 1
+    """Left DH116S CANFD node ID."""
+
+    dh116s_right_node_id: int = 1
+    """Right DH116S CANFD node ID."""
+
+    dh116s_current: int = 1000
+    """DH116S max current passed to LHandPro SDK."""
+
+    dh116s_home_wait_time: float = 2.0
+    """DH116S homing wait time passed to LHandPro SDK."""
+
+    dh116s_trigger_close_ratio: float = 0.7
+    """Maximum DH116S flexion ratio for trigger-style policy actions."""
+
     # Camera
     camera_host: str = "localhost"
     """Camera server host."""
@@ -152,16 +205,41 @@ class InferenceLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate."""
 
+    # Optional inference diagnostics
+    visualize: bool = False
+    """Start the existing real-time MuJoCo target/measured visualizer."""
+
+    record_dir: str = ""
+    """Record the C++ g1_debug stream to parquet in this directory."""
+
+    record_duration: float = 0
+    """Recorder duration in seconds. Zero records until the tmux session stops."""
+
+    record_flush_frames: int = 1000
+    """Write one parquet row group after this many inference frames."""
+
+    compute_torques: bool = False
+    """Estimate and store per-joint PD torque in the inference recording."""
+
+    tmux_history_limit: int = 5000
+    """Maximum scrollback lines per pane; bounds tmux memory use."""
+
 
 SESSION_NAME = "sonic_inference"
 
 
 def _check_prerequisites(config: InferenceLaunchConfig):
-    """Verify that required tools and venvs exist."""
+    """Verify that required tools and runtime environments exist."""
     errors = []
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
+
+    if config.tmux_history_limit < 0:
+        errors.append("tmux_history_limit must be zero or greater")
+
+    if config.record_flush_frames <= 0:
+        errors.append("record_flush_frames must be positive")
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -177,16 +255,30 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             "Ensure the deploy directory is set up."
         )
 
-    if config.data_exporter:
-        if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
-            errors.append(
-                ".venv_data_collection not found (needed for data exporter). Run: "
-                "bash install_scripts/install_data_collection.sh"
-            )
-
-    if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
+    if (config.data_exporter or config.record_dir) and not (
+        repo_root / DATA_COLLECTION_PYTHON
+    ).is_file():
         errors.append(
-            ".venv_sim not found. Set up the simulation venv first."
+            ".venv_data_collection is missing (needed for exporter/recorder). "
+            "Run: bash install_scripts/install_data_collection.sh"
+        )
+
+    if config.record_dir and not (
+        repo_root / "gear_sonic" / "scripts" / "run_inference_recorder.py"
+    ).exists():
+        errors.append("gear_sonic/scripts/run_inference_recorder.py not found")
+
+    if config.visualize and not (
+        repo_root / "gear_sonic_deploy" / "visualize_motion.py"
+    ).exists():
+        errors.append("gear_sonic_deploy/visualize_motion.py not found")
+
+    if (config.sim or config.visualize) and not (
+        repo_root / ".venv_sim" / "bin" / "activate"
+    ).exists():
+        errors.append(
+            ".venv_sim not found (needed for simulation/visualizer). "
+            "Set up the simulation venv first."
         )
 
     if errors:
@@ -204,9 +296,24 @@ def _kill_existing_session():
     )
 
 
-def _create_tmux_session():
+def _create_tmux_session(history_limit: int):
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", SESSION_NAME],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            SESSION_NAME,
+            "history-limit",
+            str(history_limit),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "set-option", "-t", SESSION_NAME, "remain-on-exit", "off"],
         check=True,
     )
     subprocess.run(
@@ -253,6 +360,7 @@ def _check_pane_alive(pane_index: int) -> bool:
 
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    data_python = shlex.quote(str(repo_root / DATA_COLLECTION_PYTHON))
 
     _check_prerequisites(config)
     _kill_existing_session()
@@ -268,15 +376,25 @@ def main(config: InferenceLaunchConfig):
     print(f"  Prompt:          {config.prompt}")
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
+    print(f"  Init blend:      {config.initial_pose_blend_duration:.2f}s")
+    print(f"  Hand type:       {config.hand_type}")
+    if config.hand_type == "dh116s":
+        print(f"  DH116S close:    {config.dh116s_trigger_close_ratio:.2f}")
+    print(f"  State ZMQ port:  {config.state_zmq_port}")
+    print(f"  Action ZMQ port: {config.action_zmq_port}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
         print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
         print(f"    Task prompt:   {exporter_prompt}")
+    print(f"  Visualizer:      {'Yes' if config.visualize else 'No'}")
+    print(f"  Debug recorder:  {config.record_dir or 'No'}")
+    if config.record_dir:
+        print(f"    PD torques:    {'Yes' if config.compute_torques else 'No'}")
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
-    _create_tmux_session()
+    _create_tmux_session(config.tmux_history_limit)
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
@@ -320,6 +438,10 @@ def main(config: InferenceLaunchConfig):
         deploy_cmd += f"--motion-data {config.deploy_motion_data} "
     if config.deploy_output_type:
         deploy_cmd += f"--output-type {config.deploy_output_type} "
+    if config.state_zmq_port != 5557:
+        deploy_cmd += f"--zmq-out-port {config.state_zmq_port} "
+    if config.hand_type == "dh116s":
+        deploy_cmd += "--disable-hands "
     deploy_cmd += deploy_mode
 
     print("Starting C++ deploy (pane 0)...")
@@ -329,13 +451,13 @@ def main(config: InferenceLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # --- Pane 2 (bottom-left): Keyboard Publisher ---
-    keyboard_script = textwrap.dedent("""\
+    keyboard_script = textwrap.dedent(f"""\
         import zmq, time
         ctx = zmq.Context()
         pub = ctx.socket(zmq.PUB)
-        pub.bind('tcp://localhost:5580')
+        pub.bind('tcp://localhost:{config.keyboard_zmq_port}')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=init pose, [/]=toggle hands, t=prompt')
+        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=init pose, [/]=toggle hands, c=record, x=discard, t=prompt')
         while True:
             key = input()
             if key.startswith('t '):
@@ -359,15 +481,16 @@ def main(config: InferenceLaunchConfig):
     if config.data_exporter:
         exporter_cmd = (
             f"cd {repo_root} && "
-            f"source .venv_data_collection/bin/activate && "
-            f"python gear_sonic/scripts/run_data_exporter.py "
-            f"--task-prompt '{exporter_prompt}' "
+            f"{data_python} gear_sonic/scripts/run_data_exporter.py "
+            f"--task-prompt {shlex.quote(exporter_prompt)} "
             f"--data-collection-frequency {config.data_exporter_frequency} "
             f"--camera-host {config.camera_host} "
-            f"--camera-port {config.camera_port}"
+            f"--camera-port {config.camera_port} "
+            f"--state-zmq-port {config.state_zmq_port} "
+            f"--sonic-zmq-port {config.action_zmq_port}"
         )
         if config.dataset_name:
-            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+            exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
 
         print("Starting data exporter (pane 3)...")
         _send_to_pane(3, exporter_cmd, wait=2.0)
@@ -380,15 +503,99 @@ def main(config: InferenceLaunchConfig):
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
         f"--embodiment-tag {config.embodiment_tag} "
-        f"--prompt '{config.prompt}' "
+        f"--prompt {shlex.quote(config.prompt)} "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
+        f"--initial-pose-blend-duration {config.initial_pose_blend_duration} "
+        f"--hand-type {config.hand_type} "
+        f"--state-zmq-port {config.state_zmq_port} "
+        f"--action-zmq-port {config.action_zmq_port} "
+        f"--keyboard-zmq-port {config.keyboard_zmq_port} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
     )
+    if config.hand_type == "dh116s":
+        if config.dh116s_sim_mode:
+            inference_cmd += " --dh116s-sim-mode"
+        inference_cmd += f" --dh116s-action-scale {config.dh116s_action_scale}"
+        inference_cmd += f" --dh116s-sdk-dir {shlex.quote(config.dh116s_sdk_dir)}"
+        inference_cmd += f" --dh116s-left-device-index {config.dh116s_left_device_index}"
+        inference_cmd += f" --dh116s-right-device-index {config.dh116s_right_device_index}"
+        inference_cmd += f" --dh116s-left-node-id {config.dh116s_left_node_id}"
+        inference_cmd += f" --dh116s-right-node-id {config.dh116s_right_node_id}"
+        inference_cmd += f" --dh116s-current {config.dh116s_current}"
+        inference_cmd += f" --dh116s-home-wait-time {config.dh116s_home_wait_time}"
+        inference_cmd += (
+            f" --dh116s-trigger-close-ratio {config.dh116s_trigger_close_ratio}"
+        )
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
+
+    # Diagnostics live in their own tmux window so recording also works over
+    # SSH or a non-interactive service. The old local launcher opened
+    # gnome-terminal windows, which is fragile on the robot server.
+    diagnostics_enabled = config.visualize or bool(config.record_dir)
+    if diagnostics_enabled:
+        subprocess.run(
+            ["tmux", "new-window", "-d", "-t", SESSION_NAME, "-n", "diagnostics"],
+            check=True,
+        )
+        if config.visualize and config.record_dir:
+            subprocess.run(
+                [
+                    "tmux",
+                    "split-window",
+                    "-t",
+                    f"{SESSION_NAME}:diagnostics",
+                    "-h",
+                ],
+                check=True,
+            )
+
+        diagnostic_commands: list[tuple[int, str]] = []
+        next_pane = 0
+        if config.visualize:
+            visualize_cmd = (
+                f"cd {shlex.quote(str(repo_root / 'gear_sonic_deploy'))} && "
+                f"source ../.venv_sim/bin/activate && "
+                "python visualize_motion.py "
+                f"--realtime_debug_url tcp://localhost:{config.state_zmq_port} "
+                "--realtime_debug_topic g1_debug"
+            )
+            diagnostic_commands.append((next_pane, visualize_cmd))
+            next_pane += 1
+
+        if config.record_dir:
+            recorder_cmd = (
+                f"cd {shlex.quote(str(repo_root))} && "
+                f"{data_python} gear_sonic/scripts/run_inference_recorder.py "
+                f"--output-dir {shlex.quote(config.record_dir)} "
+                f"--zmq-host localhost --zmq-port {config.state_zmq_port} "
+                f"--flush-frames {config.record_flush_frames}"
+            )
+            if config.record_duration > 0:
+                recorder_cmd += f" --duration {config.record_duration}"
+            if config.compute_torques:
+                recorder_cmd += " --compute-torques"
+            diagnostic_commands.append((next_pane, recorder_cmd))
+
+        for pane, command in diagnostic_commands:
+            subprocess.run(
+                [
+                    "tmux",
+                    "send-keys",
+                    "-t",
+                    f"{SESSION_NAME}:diagnostics.{pane}",
+                    command,
+                    "C-m",
+                ],
+                check=True,
+            )
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
+            check=True,
+        )
 
     # Select the VLA inference pane
     subprocess.run(
@@ -411,6 +618,13 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 2 (top-right):    VLA Inference  <-- you are here")
     if config.data_exporter:
         print("    Pane 3 (bottom-right): Data Exporter")
+    if diagnostics_enabled:
+        print()
+        print("  Window 'diagnostics':")
+        if config.visualize:
+            print("    MuJoCo visualizer (requires a working DISPLAY)")
+        if config.record_dir:
+            print(f"    Inference recorder -> {config.record_dir}")
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation --")
     print("     click on pane 0 and press Enter to proceed **")
@@ -423,13 +637,12 @@ def main(config: InferenceLaunchConfig):
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
-        print("    c        - Start recording episode")
-        print("    s        - Stop recording (success)")
-        print("    f        - Stop recording (failure)")
+        print("    c        - Toggle recording episode")
+        print("    x        - Discard current episode")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim:
+    if config.sim or diagnostics_enabled:
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")

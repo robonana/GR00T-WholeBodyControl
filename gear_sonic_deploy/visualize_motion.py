@@ -8,7 +8,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from lxml import etree
+from xml.etree import ElementTree as etree
 
 import zmq
 import threading
@@ -216,7 +216,9 @@ def main(args) -> None:
     robot4_body.set("pos", "0 -3 -10")
     scene_worldbody.append(robot4_body)
 
-    mj_model = mujoco.MjModel.from_xml_string(etree.tostring(main_scene, pretty_print=True, encoding="unicode"))
+    mj_model = mujoco.MjModel.from_xml_string(
+        etree.tostring(main_scene.getroot(), encoding="unicode")
+    )
     mj_data = mujoco.MjData(mj_model)
 
     # Disable advanced visual effects for better performance

@@ -16,7 +16,7 @@ import json
 import time
 import argparse
 
-HEADER_SIZE = 1280  # Must match ZMQPackedMessageSubscriber::HEADER_SIZE
+HEADER_SIZE = 2048  # Must match ZMQPackedMessageSubscriber::HEADER_SIZE
 
 class ZMQPublisher:
     """Publisher for ZMQManager topics"""
@@ -700,4 +700,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

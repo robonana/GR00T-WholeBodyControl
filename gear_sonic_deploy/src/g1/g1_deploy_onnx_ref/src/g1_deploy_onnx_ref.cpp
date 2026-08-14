@@ -56,6 +56,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <unistd.h>
 #include <cstring>
 #include <functional>
@@ -123,6 +124,7 @@
 
 #include <cuda_runtime.h>
 #include "../include/state_logger.hpp"
+#include "../include/latency_logger.hpp"
 
 // Encoder
 #include "../include/encoder.hpp"
@@ -248,10 +250,7 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
-    // When false (--no-hands), the deploy never initializes or publishes the Dex3
-    // hand channel (rt/dex3/cmd). Used in sim so an external hand streamer can own
-    // that channel without the deploy's zero commands contending with it.
-    bool publish_hands_ = true;
+    bool disable_hands_ = false;
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -291,6 +290,7 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
+    ActionLatencyLogger action_latency_logger_;
     std::unique_ptr<AudioThread> audio_thread_;
     
     // =========================================================================
@@ -1742,6 +1742,7 @@ class G1Deploy {
               {"motion_joint_velocities_lowerbody_10frame_step1", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, lower_body_joint_mujoco_order_in_isaaclab_index); }},
               {"motion_joint_positions_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
               {"motion_joint_positions_wrists_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 2, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
+              {"motion_joint_positions_wrists_4frame_step1", 24, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 4, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},  // low-latency SONIC (smpl 4-frame)
               {"motion_joint_velocities_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
               {"motion_joint_positions_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 5, 5); }},
               {"motion_joint_velocities_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 5, 5); }},
@@ -1751,7 +1752,8 @@ class G1Deploy {
               {"smpl_joints_10frame_step5", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 5); }},  // 24*3*10
               {"smpl_joints_10frame_step1", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1); }},  // 24*3*10
               {"smpl_joints_lower_10frame_step1", 270, [this](std::vector<double>& buf, size_t offset) {return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1, {0,1,2,4,5,7,8,10,11}); }},  // 9*3*10 lower body joints
-              {"smpl_joints_2frame_step1", 144, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 2, 1); }},  // 24*3*10
+              {"smpl_joints_2frame_step1", 144, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 2, 1); }},  // 24*3*2
+              {"smpl_joints_4frame_step1", 288, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 4, 1); }},  // 24*3*4, low-latency SONIC
               {"smpl_pose", 63, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 1, 1); }},  // 21*3
               {"smpl_pose_5frame_step5", 315, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 5, 5); }},  // 21*3*5
               {"smpl_pose_10frame_step5", 630, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 10, 5); }},  // 21*3*10
@@ -1760,6 +1762,7 @@ class G1Deploy {
               {"smpl_root_z_10frame_step1", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 1); }},
               {"smpl_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1); }},
               {"smpl_anchor_orientation_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1); }},
+              {"smpl_anchor_orientation_4frame_step1", 24, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 4, 1); }},  // low-latency SONIC (smpl 4-frame)
               // SMPL heading-only variants (mode=1, matches Python smpl_root_ori_heading_multi_future)
               {"smpl_anchor_orientation_heading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 1); }},
               {"smpl_anchor_orientation_heading_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1, 1); }},
@@ -2161,7 +2164,7 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      bool publish_hands = true)
+      bool disable_hands = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2172,7 +2175,7 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
-        publish_hands_(publish_hands),
+        disable_hands_(disable_hands),
         program_state_(ProgramState::INIT),
         last_action {0.0},
         last_left_hand_action {0.0},
@@ -2187,11 +2190,11 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above).
-      // Skipped under --no-hands so the deploy never creates the rt/dex3/cmd
-      // publisher (an external hand streamer owns that channel in sim).
-      if (publish_hands_) {
+      if (!disable_hands_) {
+        // Initialize Dex3 hands (ChannelFactory already initialized above)
         dex3_hands_.initialize("");
+      } else {
+        std::cout << "[INFO] Dex3 hand control disabled (--disable-hands)" << std::endl;
       }
 
       audio_thread_ = std::make_unique<AudioThread>();
@@ -2525,7 +2528,9 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        if (!disable_hands_) {
+          dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        }
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2685,8 +2690,8 @@ class G1Deploy {
         lowcmd_publisher_->Write(dds_low_command);
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      if (publish_hands_) {
+      if (!disable_hands_) {
+        // Publish Dex3 hand commands at the same publish cadence
         dex3_hands_.writeOnce();
       }
     }
@@ -2709,6 +2714,7 @@ class G1Deploy {
       }
       CreateDampingCommand();
       LowCommandWriter();
+      action_latency_logger_.Flush();
       std::cout << "Stop" << std::endl;
     }
 
@@ -2757,12 +2763,16 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        if (!disable_hands_) {
+          dex3_hands_.close(true);
+          dex3_hands_.close(false);
+        }
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        if (!disable_hands_) {
+          dex3_hands_.open(true);
+          dex3_hands_.open(false);
+        }
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2915,19 +2925,21 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
-          left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+      if (!disable_hands_) {
+        auto left_hand_state_ptr = dex3_hands_.getState(true);
+        if (left_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
+            left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+          }
         }
-      }
-      
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
-          right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+
+        auto right_hand_state_ptr = dex3_hands_.getState(false);
+        if (right_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
+            right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+          }
         }
       }
 
@@ -3863,6 +3875,7 @@ class G1Deploy {
             std::cout << "Stopping control system." << std::endl;
             return;
           }
+          auto robot_state_gather_end_time = std::chrono::steady_clock::now();
 
           // Handle temperature report request (F key)
           if (report_temperature_) {
@@ -3908,6 +3921,8 @@ class G1Deploy {
           if (!GatherInputInterfaceData()) {
             return;
           }
+          auto input_snapshot_end_time = std::chrono::steady_clock::now();
+          auto source_update_time = input_interface_->GetLastUpdateTime();
 
           
           // Lock mutex for observation gathering and output sending to ensure consistency
@@ -3959,17 +3974,42 @@ class G1Deploy {
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
-          
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
-          
-          // Update last hand actions for logging (use buffered data)
-          for (int i = 0; i < 7; ++i) {
-            last_left_hand_action[i] = left_hand_joint_buffer_[i];
-            last_right_hand_action[i] = right_hand_joint_buffer_[i];
+          ActionLatencySample latency_sample;
+          latency_sample.control_tick = static_cast<std::uint64_t>(logging_counter_);
+          latency_sample.source_timestamp_available = source_update_time.has_value();
+          if (source_update_time.has_value() && source_update_time.value() <= motor_command_end_time) {
+            latency_sample.source_age_at_snapshot_ms = std::chrono::duration<double, std::milli>(
+                input_snapshot_end_time - source_update_time.value()).count();
+            latency_sample.source_to_action_ready_ms = std::chrono::duration<double, std::milli>(
+                motor_command_end_time - source_update_time.value()).count();
+          }
+          latency_sample.robot_state_gather_ms = std::chrono::duration<double, std::milli>(
+              robot_state_gather_end_time - obs_start_time).count();
+          latency_sample.input_snapshot_ms = std::chrono::duration<double, std::milli>(
+              input_snapshot_end_time - robot_state_gather_end_time).count();
+          latency_sample.observation_total_ms = std::chrono::duration<double, std::milli>(
+              obs_end_time - obs_start_time).count();
+          latency_sample.policy_ms = std::chrono::duration<double, std::milli>(
+              motor_command_end_time - obs_end_time).count();
+          latency_sample.obs_to_action_ms = std::chrono::duration<double, std::milli>(
+              motor_command_end_time - obs_start_time).count();
+          latency_sample.low_state_age_ms = used_low_state_data_.GetAgeMs();
+          latency_sample.imu_age_ms = used_imu_torso_data_.GetAgeMs();
+          action_latency_logger_.Log(latency_sample);
+
+          if (!disable_hands_) {
+            // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
+            dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+
+            // set hand poses (use buffered data for consistency)
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+
+            // Update last hand actions for logging (use buffered data)
+            for (int i = 0; i < 7; ++i) {
+              last_left_hand_action[i] = left_hand_joint_buffer_[i];
+              last_right_hand_action[i] = right_hand_joint_buffer_[i];
+            }
           }
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
@@ -4080,8 +4120,10 @@ class G1Deploy {
                         << vr_3point_compliance_buffer_[2] << "]";
             }
             
-            // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            if (!disable_hands_) {
+              // Print hand max close ratio (keyboard-controlled via X/C keys)
+              std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            }
             
             std::cout << std::endl;
           }
@@ -4102,7 +4144,18 @@ class G1Deploy {
  * All other arguments are optional flags (see --help for full list).
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
+namespace {
+volatile std::sig_atomic_t shutdown_requested = 0;
+
+void HandleShutdownSignal(int) {
+  shutdown_requested = 1;
+}
+}  // namespace
+
 int main(int argc, char const* argv[]) {
+  std::signal(SIGINT, HandleShutdownSignal);
+  std::signal(SIGTERM, HandleShutdownSignal);
+  std::signal(SIGHUP, HandleShutdownSignal);
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
@@ -4126,6 +4179,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --disable-hands: disable Dex3 hand control for external hand sidecars" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4166,6 +4220,7 @@ int main(int argc, char const* argv[]) {
 
   // Parse optional arguments
   bool disableCrcCheck = false;\
+  bool disable_hands = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4189,14 +4244,13 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
-  bool publishHands = true; // --no-hands disables the deploy's Dex3/rt/dex3 publishing
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
-    } else if (std::string(argv[i]) == "--no-hands") {
-      publishHands = false;
-      std::cout << "[INFO] Hand (Dex3 rt/dex3/cmd) publishing disabled (--no-hands)" << std::endl;
+    } else if (std::string(argv[i]) == "--disable-hands") {
+      disable_hands = true;
+      std::cout << "[INFO] Dex3 hand control disabled for external hand sidecar" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4455,24 +4509,24 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    publishHands
+    disable_hands
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
+    while (!custom.operator_state.stop && !shutdown_requested && rclcpp::ok()) {
       sleep(0.02); 
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !shutdown_requested) { sleep(0.02); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !shutdown_requested) { sleep(0.02); }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;

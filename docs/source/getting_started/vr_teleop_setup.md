@@ -114,18 +114,6 @@ Activate it with:
 source .venv_teleop/bin/activate   # prompt: (gear_sonic_teleop)
 ```
 
-If you plan to drive a **Fourier FDH-6 dexterous hand** from XR hand tracking,
-install the additional Python packages inside `.venv_teleop`:
-
-```bash
-source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-```
-
-These extra packages are only needed for the Fourier hand path. Basic PICO
-whole-body teleoperation without Fourier hands does not require them.
-
 ---
 
 ## Step 4: Connect the PICO to Your Workstation

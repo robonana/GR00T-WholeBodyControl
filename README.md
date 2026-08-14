@@ -31,6 +31,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 
 ## News
 
+- **[2026-06-16]** **Low-latency SONIC release** — added a low-latency G1 controller variant on [Hugging Face](https://huggingface.co/nvidia/GEAR-SONIC/tree/main/low_latency) under `low_latency/`. See the [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#low-latency-sonic-variant) and [VLA Inference](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_inference.html#low-latency-sonic-wbc) docs for usage.
 - **[2026-05-07]** 🤖 **End-to-end VLA workflow on G1** — collect teleop data, fine-tune Isaac-GR00T N1.7, and deploy with SONIC whole-body control. See [Data Collection](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/data_collection.html), [VLA Workflow](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_workflow.html), and [VLA Inference](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_inference.html).
 - **[2026-04-27]** 🧩 **MotionBricks preview** — interactive G1 demo, pretrained checkpoints (VQVAE · pose · root), synthetic training code, and motion-representation docs. See [`motionbricks/`](motionbricks/) and the [project page](https://nvlabs.github.io/motionbricks/).
 - **[2026-04-14]** 🌐 **[Live web demo](https://nvlabs.github.io/GEAR-SONIC/demo.html)** — try SONIC interactively in your browser. Features [Kimodo](https://github.com/nv-tlabs/kimodo) text-to-motion generation.
@@ -76,10 +77,35 @@ SONIC is a humanoid behavior foundation model that gives robots a core set of mo
 
 In this repo, we release SONIC's training code, deployment framework, model checkpoints, and teleoperation stack for data collection.
 
+The low-latency SONIC variant is available on Hugging Face under [`low_latency/`](https://huggingface.co/nvidia/GEAR-SONIC/tree/main/low_latency). It keeps the default top-level deployment policy unchanged. Download it with `python download_from_hf.py --low-latency`.
+
+For C++ deployment:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+For the Python VLA launcher:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
 
 ## VR Whole-Body Teleoperation
 
 SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling natural human-to-robot motion transfer for data collection and interactive control.
+
+This repo can also drive the headset over Isaac Teleop / CloudXR by launching `gear_sonic/scripts/pico_manager_thread_server.py --input-source isaac-teleop`. The streamer hosts the CloudXR runtime in-process via `isaacteleop[cloudxr]` — no separate publisher container required. That path is currently documented and supported only for **G1 with a Thor backpack**. The Isaac Teleop bring-up steps are documented in [`docs/source/tutorials/isaac_teleop_publisher_setup.md`](docs/source/tutorials/isaac_teleop_publisher_setup.md).
 
 <div align="center">
 <table>
@@ -117,125 +143,6 @@ SONIC supports real-time whole-body teleoperation via PICO VR headset, enabling 
 </tr>
 </table>
 </div>
-
-### Teleop quick start
-
-For a full setup walkthrough, see the
-[VR Teleop Setup](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/vr_teleop_setup.html)
-and
-[VR Whole-Body Teleop tutorial](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vr_wholebody_teleop.html).
-
-Typical simulation teleop uses three terminals:
-
-```bash
-# Terminal 1: MuJoCo simulator
-source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
-
-# Terminal 2: C++ deployment bridge
-cd gear_sonic_deploy
-source scripts/setup_env.sh
-./deploy.sh --input-type zmq_manager sim
-
-# Terminal 3: PICO teleop manager
-cd ..
-source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
-
-# If you are using Fourier FDH-6 hands and want Pico trigger control instead,
-# run this Terminal 3 command:
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier_trigger
-```
-
-### Hand control modes
-
-The PICO teleop manager supports three hand-control modes through
-`--hand_mode`:
-
-| Mode | Command option | Behavior |
-| --- | --- | --- |
-| Legacy trigger/grip | `--hand_mode trigger` or omit `--hand_mode` | Original G1/Dex3 7-DOF hand mapping from Pico trigger/grip inputs. |
-| Fourier XR hand tracking | `--hand_mode fourier` | XR hand-tracking landmarks are retargeted to Fourier FDH-6 and sent through the Fourier SDK. |
-| Fourier trigger control | `--hand_mode fourier_trigger` | Pico left/right analog triggers directly open/close the left/right Fourier FDH-6 hands. |
-
-> For trigger-controlled Fourier hands, use `--hand_mode fourier_trigger`.
-> Do **not** use `--hand_mode fourier` unless you want XR hand-tracking control.
-
-Default legacy mode:
-
-```bash
-source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
-```
-
-For Fourier FDH-6 hands driven directly from XR hand tracking:
-
-```bash
-source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
-```
-
-For Fourier FDH-6 hands driven directly from the Pico controller triggers
-(left trigger controls the left hand, right trigger controls the right hand):
-
-```bash
-source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier_trigger
-```
-
-In `fourier_trigger` mode:
-
-- left trigger = left Fourier hand open/close
-- right trigger = right Fourier hand open/close
-- trigger value `0.0` = open, `1.0` = full close target
-- Pico grip buttons remain available for existing manager/data-collection shortcuts
-
-Keyboard fallbacks in the `pico_manager_thread_server.py` terminal:
-
-- `a` = `A+B+X+Y` (start/stop policy)
-- `b` = `A+X` (toggle `PLANNER` / `POSE`)
-
-### Data collection with Fourier hands
-
-When you use the all-in-one data-collection launcher, pass the PICO hand mode
-through `--pico-hand-mode`. For trigger-controlled Fourier FDH-6 collection,
-run:
-
-```bash
-python gear_sonic/scripts/launch_data_collection.py \
-  --camera-host 192.168.123.164 \
-  --dataset-name real_test_001 \
-  --task-prompt "test data collection" \
-  --pico-hand-mode fourier_trigger
-```
-
-`launch_data_collection.py --pico-hand-mode fourier_trigger` forwards
-`--hand_mode fourier_trigger` to `pico_manager_thread_server.py`. The exporter
-saves the commanded Fourier targets as:
-
-- `teleop.left_hand_fourier_joints` — 6 values in
-  `[thumb_yaw, thumb_pitch, index, middle, ring, pinky]` order
-- `teleop.right_hand_fourier_joints` — same 6-value order
-
-It also reads Fourier SDK `get_pos()` feedback and saves the measured motor
-positions, converted to the same order/radian units:
-
-- `observation.left_hand_fourier_actual_joints`
-- `observation.right_hand_fourier_actual_joints`
-
-Without `--pico-hand-mode fourier_trigger`, the launcher keeps the default
-legacy `trigger` hand mode and will not command Fourier hands.
-
-To test only the Fourier feedback path without sending motor commands:
-
-```bash
-source .venv_teleop/bin/activate
-python gear_sonic/scripts/test_fourier_hand_feedback.py
-```
 
 ## Kinematic Planner
 

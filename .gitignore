@@ -187,6 +187,8 @@ MUJOCO_LOG.TXT
 # IsaacDeploy
 external_dependencies/isaac_teleop_app/isaac-deploy
 external_dependencies/doc/
+external_dependencies/unitree_sv1_camera_sdk_v2/
+gear_sonic/camera/native/sv1_unlock
 
 # XRoboToolkit pybind (cloned locally on aarch64 by install_pico.sh)
 external_dependencies/XRoboToolkit-PC-Service-Pybind/
@@ -219,4 +221,3 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
-.omx/

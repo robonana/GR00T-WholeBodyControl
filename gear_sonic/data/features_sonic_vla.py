@@ -15,27 +15,14 @@ from typing import Literal
 
 from gear_sonic.data.robot_model import RobotModel
 
-EGO_VIEW_HEIGHT: int = 480
-EGO_VIEW_WIDTH: int = 640
+# SV1-25 publishes one full-resolution eye at 928x800. Keep this schema in
+# sync with install_scripts/run_sv1_camera_server.sh so video validation does
+# not resize or reject camera frames during data collection.
+EGO_VIEW_HEIGHT: int = 800
+EGO_VIEW_WIDTH: int = 928
 WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
 FPS: int = 50
-FOURIER_HAND_JOINT_NAMES: list[str] = [
-    "thumb_yaw",
-    "thumb_pitch",
-    "index",
-    "middle",
-    "ring",
-    "pinky",
-]
-DH116S_HAND_JOINT_NAMES: list[str] = [
-    "thumb_abd",
-    "thumb_flex",
-    "index",
-    "middle",
-    "ring",
-    "pinky",
-]
 
 
 _JOINT_GROUPS_FOR_STATE: list[str] = [
@@ -113,23 +100,13 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "original_key": "observation.init_base_quat",
                 "rotation_type": "quaternion",
             },
-            "left_hand_fourier_actual_joints": {
-                "start": 0,
-                "end": 6,
-                "original_key": "observation.left_hand_fourier_actual_joints",
-            },
-            "right_hand_fourier_actual_joints": {
-                "start": 0,
-                "end": 6,
-                "original_key": "observation.right_hand_fourier_actual_joints",
-            },
-            "left_hand_dh116s_actual_joints": {
-                "start": 0,
+            "left_dh116s_hand": {
+                "start": 1,
                 "end": 6,
                 "original_key": "observation.left_hand_dh116s_actual_joints",
             },
-            "right_hand_dh116s_actual_joints": {
-                "start": 0,
+            "right_dh116s_hand": {
+                "start": 1,
                 "end": 6,
                 "original_key": "observation.right_hand_dh116s_actual_joints",
             },
@@ -177,23 +154,13 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "end": 7,
                 "original_key": "teleop.right_hand_joints",
             },
-            "left_hand_fourier_joints": {
-                "start": 0,
-                "end": 6,
-                "original_key": "teleop.left_hand_fourier_joints",
-            },
-            "right_hand_fourier_joints": {
-                "start": 0,
-                "end": 6,
-                "original_key": "teleop.right_hand_fourier_joints",
-            },
-            "left_hand_dh116s_joints": {
-                "start": 0,
+            "left_dh116s_hand_joints": {
+                "start": 1,
                 "end": 6,
                 "original_key": "teleop.left_hand_dh116s_joints",
             },
-            "right_hand_dh116s_joints": {
-                "start": 0,
+            "right_dh116s_hand_joints": {
+                "start": 1,
                 "end": 6,
                 "original_key": "teleop.right_hand_dh116s_joints",
             },
@@ -277,6 +244,11 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (num_joints,),
             "names": joint_names,
         },
+        "observation.velocity": {
+            "dtype": "float64",
+            "shape": (num_joints,),
+            "names": joint_names,
+        },
         "observation.eef_state": {
             "dtype": "float64",
             "shape": (14,),
@@ -312,25 +284,55 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (4,),
             "names": ["init_base_qw", "init_base_qx", "init_base_qy", "init_base_qz"],
         },
-        "observation.left_hand_fourier_actual_joints": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": [f"left_fourier_actual_{name}" for name in FOURIER_HAND_JOINT_NAMES],
+        "observation.base_ang_vel": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_wx", "base_wy", "base_wz"],
         },
-        "observation.right_hand_fourier_actual_joints": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": [f"right_fourier_actual_{name}" for name in FOURIER_HAND_JOINT_NAMES],
+        "observation.torso_orientation": {
+            "dtype": "float64",
+            "shape": (4,),
+            "names": ["torso_qw", "torso_qx", "torso_qy", "torso_qz"],
+        },
+        "observation.torso_ang_vel": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["torso_wx", "torso_wy", "torso_wz"],
+        },
+        "observation.motor_temperature": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": "motor_temperature",
+        },
+        "debug.body_q_target": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": "body_q_target",
+        },
+        "debug.body_q_measured": {
+            "dtype": "float64",
+            "shape": (29,),
+            "names": "body_q_measured",
+        },
+        "debug.base_trans_target": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["target_x", "target_y", "target_z"],
+        },
+        "debug.base_trans_measured": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["measured_x", "measured_y", "measured_z"],
         },
         "observation.left_hand_dh116s_actual_joints": {
             "dtype": "float32",
             "shape": (6,),
-            "names": [f"left_dh116s_actual_{name}" for name in DH116S_HAND_JOINT_NAMES],
+            "names": "left_hand_dh116s_actual_joints",
         },
         "observation.right_hand_dh116s_actual_joints": {
             "dtype": "float32",
             "shape": (6,),
-            "names": [f"right_dh116s_actual_{name}" for name in DH116S_HAND_JOINT_NAMES],
+            "names": "right_hand_dh116s_actual_joints",
         },
         "teleop.delta_heading": {
             "dtype": "float64",
@@ -379,25 +381,15 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (7,),
             "names": "right_hand_joints",
         },
-        "teleop.left_hand_fourier_joints": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": [f"left_fourier_{name}" for name in FOURIER_HAND_JOINT_NAMES],
-        },
-        "teleop.right_hand_fourier_joints": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": [f"right_fourier_{name}" for name in FOURIER_HAND_JOINT_NAMES],
-        },
         "teleop.left_hand_dh116s_joints": {
             "dtype": "float32",
             "shape": (6,),
-            "names": [f"left_dh116s_{name}" for name in DH116S_HAND_JOINT_NAMES],
+            "names": "left_hand_dh116s_joints",
         },
         "teleop.right_hand_dh116s_joints": {
             "dtype": "float32",
             "shape": (6,),
-            "names": [f"right_dh116s_{name}" for name in DH116S_HAND_JOINT_NAMES],
+            "names": "right_hand_dh116s_joints",
         },
         "teleop.smpl_frame_index": {
             "dtype": "int64",

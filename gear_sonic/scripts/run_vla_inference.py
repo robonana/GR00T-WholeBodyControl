@@ -14,13 +14,12 @@ running PolicyServer.
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
-  i  -> blend smoothly to initial pose (or snap if no prior token) and switch to POSE mode
+  i  -> blend smoothly to initial pose and switch to POSE mode
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
-  c  -> start recording (handled by data exporter if running)
-  s  -> stop recording success (handled by data exporter)
-  f  -> stop recording failure (handled by data exporter)
+  c  -> toggle recording (handled by data exporter if running)
+  x  -> discard current episode (handled by data exporter)
 """
 
 from dataclasses import dataclass
@@ -110,12 +109,46 @@ class InferenceConfig:
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
 
+    hand_type: str = "dex3"
+    """Hand type: 'dex3' (official C++ Dex3 path) or 'dh116s' (Python sidecar)."""
+
+    # DH116S hand options
+    dh116s_sim_mode: bool = False
+    """Run DH116S sidecar in simulation mode without hardware I/O."""
+
+    dh116s_action_scale: float = 1.0
+    """Scale DH116S hand actions for smoothing (0.0-1.0)."""
+
+    dh116s_sdk_dir: str = "~/lhandpro_project"
+    """LHandPro SDK directory."""
+
+    dh116s_left_device_index: int = 1
+    """Left DH116S USB-CANFD device index."""
+
+    dh116s_right_device_index: int = 0
+    """Right DH116S USB-CANFD device index."""
+
+    dh116s_left_node_id: int = 1
+    """Left DH116S CANFD node ID."""
+
+    dh116s_right_node_id: int = 1
+    """Right DH116S CANFD node ID."""
+
+    dh116s_current: int = 1000
+    """DH116S max current passed to LHandPro SDK."""
+
+    dh116s_home_wait_time: float = 2.0
+    """DH116S homing wait time passed to LHandPro SDK."""
+
+    dh116s_trigger_close_ratio: float = 0.7
+    """Maximum DH116S flexion ratio used for canonical trigger-style actions."""
+
     # Prompt / eval
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
 
     # Initial pose
-    initial_pose_blend_duration: float = 1.0
+    initial_pose_blend_duration: float = 3.0
     """Duration (seconds) for smooth interpolation to initial pose. The robot
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
@@ -175,6 +208,10 @@ def pack_latent_action_message(
                     f"left_hand_joints must have shape [7], got {left_hand_joints.shape}"
                 )
             left_hand_joints = left_hand_joints.reshape(1, 7)
+        elif left_hand_joints.shape[-1] != 7:
+            raise ValueError(
+                f"left_hand_joints must have final dimension 7, got {left_hand_joints.shape}"
+            )
         pose_data["left_hand_joints"] = left_hand_joints
 
     if right_hand_joints is not None:
@@ -185,23 +222,83 @@ def pack_latent_action_message(
                     f"right_hand_joints must have shape [7], got {right_hand_joints.shape}"
                 )
             right_hand_joints = right_hand_joints.reshape(1, 7)
+        elif right_hand_joints.shape[-1] != 7:
+            raise ValueError(
+                f"right_hand_joints must have final dimension 7, got {right_hand_joints.shape}"
+            )
         pose_data["right_hand_joints"] = right_hand_joints
 
     return pack_pose_message(pose_data, topic="pose", version=4)
 
 
-def get_action_field(action_dict: dict, key: str):
-    """Get action field from dict, checking both with and without 'action.' prefix."""
-    value = action_dict.get(key)
-    if value is not None:
-        return value
-    value = action_dict.get(f"action.{key}")
-    if value is not None:
-        return value
+def publish_dh116s_state(zmq_socket, dh116s_hand) -> None:
+    """Publish latest DH116S actual joints for the data exporter sidecar fields."""
+    if dh116s_hand is None:
+        return
+    left_state, right_state = dh116s_hand.read_state()
+    zmq_socket.send(
+        pack_pose_message(
+            {
+                "left_hand_dh116s_actual_joints": np.asarray(
+                    left_state, dtype=np.float32
+                ),
+                "right_hand_dh116s_actual_joints": np.asarray(
+                    right_state, dtype=np.float32
+                ),
+            },
+            topic="dh116s_state",
+        )
+    )
+
+
+def get_action_field(action_dict: dict, key: str, aliases: tuple[str, ...] = ()):
+    """Get an action field, checking aliases and optional ``action.`` prefixes."""
+    candidate_keys = (key, *aliases)
+    for candidate_key in candidate_keys:
+        value = action_dict.get(candidate_key)
+        if value is not None:
+            return value
+        value = action_dict.get(f"action.{candidate_key}")
+        if value is not None:
+            return value
     raise AssertionError(
-        f"Required action field '{key}' (or 'action.{key}') not found in processed_action. "
+        f"Required action field '{key}' not found in processed_action. "
+        f"Checked keys: {candidate_keys} with optional 'action.' prefix. "
         f"Available keys: {list(action_dict.keys())}"
     )
+
+
+def _coerce_motion_token(value, expected_dim: int) -> np.ndarray | None:
+    """Return a flat float32 motion token when value has the expected dimension."""
+    if value is None:
+        return None
+    token = np.asarray(value, dtype=np.float32).reshape(-1)
+    if token.size != expected_dim:
+        return None
+    if not np.all(np.isfinite(token)):
+        return None
+    return token.copy()
+
+
+def select_initial_pose_blend_start_token(
+    last_sent_motion_token: np.ndarray | None,
+    state_msg: dict | None,
+    target_token: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    """Choose the token used as the starting point for an initial-pose blend."""
+    target_token = np.asarray(target_token, dtype=np.float32).reshape(-1)
+    expected_dim = target_token.size
+
+    token = _coerce_motion_token(last_sent_motion_token, expected_dim)
+    if token is not None:
+        return token, "last sent token"
+
+    if isinstance(state_msg, dict):
+        token = _coerce_motion_token(state_msg.get("token_state"), expected_dim)
+        if token is not None:
+            return token, "feedback token_state"
+
+    return np.zeros(expected_dim, dtype=np.float32), "zero token fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +311,7 @@ def prepare_observation_from_sensors(
     state_subscriber,
     robot_model,
     language_prompt: str,
+    dh116s_hand=None,
     log_errors: bool = False,
 ):
     """Read sensors and prepare observation for the VLA policy.
@@ -235,14 +333,21 @@ def prepare_observation_from_sensors(
 
     cam_img = camera_msg["images"]["ego_view"]
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
+    use_dh116s = dh116s_hand is not None
+    left_hand_q = np.asarray(state_msg["left_hand_q"], dtype=np.float32).copy()
+    right_hand_q = np.asarray(state_msg["right_hand_q"], dtype=np.float32).copy()
+    if use_dh116s:
+        left_hand_q = np.zeros(7, dtype=np.float32)
+        right_hand_q = np.zeros(7, dtype=np.float32)
+    else:
+        # Copy index finger data to middle finger (hardware coupling)
+        left_hand_q[5] = left_hand_q[3]
+        left_hand_q[6] = left_hand_q[4]
 
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
-        left_hand_actuated_joint_values=state_msg["left_hand_q"],
-        right_hand_actuated_joint_values=state_msg["right_hand_q"],
+        left_hand_actuated_joint_values=left_hand_q,
+        right_hand_actuated_joint_values=right_hand_q,
     )
 
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
@@ -271,6 +376,15 @@ def prepare_observation_from_sensors(
     observation["state"]["projected_gravity"] = np.asarray(
         projected_gravity, dtype=np.float32
     )[np.newaxis, np.newaxis]
+
+    if use_dh116s:
+        left_dh116s, right_dh116s = dh116s_hand.read_state()
+        observation["state"]["left_dh116s_hand"] = np.asarray(
+            left_dh116s[1:6], dtype=np.float32
+        )[np.newaxis, np.newaxis]
+        observation["state"]["right_dh116s_hand"] = np.asarray(
+            right_dh116s[1:6], dtype=np.float32
+        )[np.newaxis, np.newaxis]
 
     return observation
 
@@ -355,8 +469,18 @@ def _inference_worker_loop(
 # ---------------------------------------------------------------------------
 
 
-def _compute_closed_hand_joints(side: str) -> np.ndarray:
+def _compute_closed_hand_joints(
+    side: str,
+    hand_type: str = "dex3",
+    dh116s_trigger_close_ratio: float = 0.5,
+) -> np.ndarray:
     """Compute closed hand joint positions using G1GripperInverseKinematicsSolver."""
+    if hand_type == "dh116s":
+        from gear_sonic.utils.inference.dh116s_inference_hand import (
+            make_trigger_close_q,
+        )
+
+        return make_trigger_close_q(dh116s_trigger_close_ratio)
     side_str = "left" if side.upper() == "L" else "right"
     solver = G1GripperInverseKinematicsSolver(side=side_str)
     return solver._get_middle_close_q_desired().astype(np.float32)
@@ -364,8 +488,35 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 
 def main(config: InferenceConfig):
     pause_loop = True
+    if config.hand_type not in {"dex3", "dh116s"}:
+        raise ValueError("--hand-type must be one of: dex3, dh116s")
+    if not 0.0 <= config.dh116s_trigger_close_ratio <= 1.0:
+        raise ValueError("--dh116s-trigger-close-ratio must be in [0.0, 1.0]")
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+
+    dh116s_hand = None
+    compose_dh116s_joints = None
+    if config.hand_type == "dh116s":
+        from gear_sonic.utils.inference.dh116s_inference_hand import (
+            DH116SInferenceHand,
+            compose_dh116s_joints as _compose_dh116s_joints,
+        )
+
+        compose_dh116s_joints = _compose_dh116s_joints
+        dh116s_hand = DH116SInferenceHand(
+            simulation_mode=config.dh116s_sim_mode,
+            action_scale=config.dh116s_action_scale,
+            sdk_dir=config.dh116s_sdk_dir,
+            max_current=config.dh116s_current,
+            left_device_index=config.dh116s_left_device_index,
+            right_device_index=config.dh116s_right_device_index,
+            left_node_id=config.dh116s_left_node_id,
+            right_node_id=config.dh116s_right_node_id,
+            home_wait_time=config.dh116s_home_wait_time,
+            trigger_close_ratio=config.dh116s_trigger_close_ratio,
+        )
+        print_green("DH116S hand driver initialized (Python sidecar; C++ hands disabled)")
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
@@ -417,58 +568,91 @@ def main(config: InferenceConfig):
         """Publish initial pose command to move robot to starting position."""
         print("Moving to initial pose")
         left_hand = (
-            _compute_closed_hand_joints("L")
+            _compute_closed_hand_joints(
+                "L", config.hand_type, config.dh116s_trigger_close_ratio
+            )
             if initial_pose_left_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            else (
+                compose_dh116s_joints(np.zeros(5, dtype=np.float32))
+                if config.hand_type == "dh116s"
+                else np.zeros(7, dtype=np.float32)
+            )
         )
         right_hand = (
-            _compute_closed_hand_joints("R")
+            _compute_closed_hand_joints(
+                "R", config.hand_type, config.dh116s_trigger_close_ratio
+            )
             if initial_pose_right_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            else (
+                compose_dh116s_joints(np.zeros(5, dtype=np.float32))
+                if config.hand_type == "dh116s"
+                else np.zeros(7, dtype=np.float32)
+            )
         )
-        zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
-            frame_index=np.array([0], dtype=np.int64),
-            left_hand_joints=left_hand,
-            right_hand_joints=right_hand,
-        )
+        if config.hand_type == "dh116s":
+            zmq_message = pack_latent_action_message(
+                motion_token=LATENT_INITIAL_MOTION_TOKEN,
+                frame_index=np.array([0], dtype=np.int64),
+            )
+            dh116s_hand.send_joints(left_hand, right_hand)
+            publish_dh116s_state(zmq_socket, dh116s_hand)
+        else:
+            zmq_message = pack_latent_action_message(
+                motion_token=LATENT_INITIAL_MOTION_TOKEN,
+                frame_index=np.array([0], dtype=np.int64),
+                left_hand_joints=left_hand,
+                right_hand_joints=right_hand,
+            )
         zmq_socket.send(zmq_message)
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
         print("Initial pose done.")
 
     def blend_to_initial_pose(duration_s: float) -> bool:
-        """Smoothly interpolate from the last sent motion token to the initial pose.
+        """Smoothly interpolate from the current motion token to the initial pose.
 
         Linearly blends over ``duration_s`` seconds at the action publish rate,
-        sending intermediate tokens each loop iteration. Returns True if blend
-        was performed, False if skipped (no previous token available).
+        sending intermediate tokens each loop iteration.
         """
         nonlocal last_sent_motion_token
-        if last_sent_motion_token is None:
-            print("No previous motion token — snapping to initial pose instead.")
-            publish_initial_pose()
-            return False
 
-        start_token = last_sent_motion_token.copy()
         target_token = LATENT_INITIAL_MOTION_TOKEN.copy()
+        state_msg = state_subscriber.get_msg(clear=False)
+        start_token, start_source = select_initial_pose_blend_start_token(
+            last_sent_motion_token=last_sent_motion_token,
+            state_msg=state_msg,
+            target_token=target_token,
+        )
         num_steps = max(1, round(config.action_publish_rate * duration_s))
         step_period = 1.0 / config.action_publish_rate
 
         left_hand = (
-            _compute_closed_hand_joints("L")
+            _compute_closed_hand_joints(
+                "L", config.hand_type, config.dh116s_trigger_close_ratio
+            )
             if initial_pose_left_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            else (
+                compose_dh116s_joints(np.zeros(5, dtype=np.float32))
+                if config.hand_type == "dh116s"
+                else np.zeros(7, dtype=np.float32)
+            )
         )
         right_hand = (
-            _compute_closed_hand_joints("R")
+            _compute_closed_hand_joints(
+                "R", config.hand_type, config.dh116s_trigger_close_ratio
+            )
             if initial_pose_right_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            else (
+                compose_dh116s_joints(np.zeros(5, dtype=np.float32))
+                if config.hand_type == "dh116s"
+                else np.zeros(7, dtype=np.float32)
+            )
         )
 
         print(
             f"Blending to initial pose over {duration_s:.2f}s "
-            f"({num_steps} steps at {config.action_publish_rate} Hz)"
+            f"({num_steps} steps at {config.action_publish_rate} Hz, "
+            f"start: {start_source})"
         )
 
         for step in range(num_steps):
@@ -477,12 +661,20 @@ def main(config: InferenceConfig):
             blended_token = ((1.0 - alpha) * start_token + alpha * target_token).astype(
                 np.float32
             )
-            zmq_message = pack_latent_action_message(
-                motion_token=blended_token,
-                frame_index=np.array([0], dtype=np.int64),
-                left_hand_joints=left_hand,
-                right_hand_joints=right_hand,
-            )
+            if config.hand_type == "dh116s":
+                zmq_message = pack_latent_action_message(
+                    motion_token=blended_token,
+                    frame_index=np.array([0], dtype=np.int64),
+                )
+                dh116s_hand.send_joints(left_hand, right_hand)
+                publish_dh116s_state(zmq_socket, dh116s_hand)
+            else:
+                zmq_message = pack_latent_action_message(
+                    motion_token=blended_token,
+                    frame_index=np.array([0], dtype=np.int64),
+                    left_hand_joints=left_hand,
+                    right_hand_joints=right_hand,
+                )
             zmq_socket.send(zmq_message)
             last_sent_motion_token = blended_token.copy()
 
@@ -547,11 +739,9 @@ def main(config: InferenceConfig):
             return
 
         if key == "c":
-            print("Keyboard: 'c' (start recording -- handled by data exporter)")
-        elif key == "s":
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
-        elif key == "f":
-            print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+            print("Keyboard: 'c' (toggle recording -- handled by data exporter)")
+        elif key == "x":
+            print("Keyboard: 'x' (discard current episode -- handled by data exporter)")
         elif key == "i":
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):
@@ -562,7 +752,7 @@ def main(config: InferenceConfig):
                 print("Note: C++ loop not running - press 'k' to start")
 
             pause_loop = True
-            if config.initial_pose_blend_duration > 0 and last_sent_motion_token is not None:
+            if config.initial_pose_blend_duration > 0:
                 blend_to_initial_pose(config.initial_pose_blend_duration)
             else:
                 publish_initial_pose()
@@ -624,6 +814,7 @@ def main(config: InferenceConfig):
                 state_subscriber=state_subscriber,
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
+                dh116s_hand=dh116s_hand,
                 log_errors=True,
             ),
             lambda obs: run_policy_inference_and_process(
@@ -692,14 +883,32 @@ def main(config: InferenceConfig):
                         get_action_field(processed_action, "motion_token"),
                         dtype=np.float32,
                     )
-                    left_hand_joints = np.asarray(
-                        get_action_field(processed_action, "left_hand_joints"),
-                        dtype=np.float32,
-                    )
-                    right_hand_joints = np.asarray(
-                        get_action_field(processed_action, "right_hand_joints"),
-                        dtype=np.float32,
-                    )
+                    if config.hand_type == "dh116s":
+                        left_hand_joints = np.asarray(
+                            get_action_field(
+                                processed_action,
+                                "left_dh116s_hand_joints",
+                                aliases=("left_hand_joints",),
+                            ),
+                            dtype=np.float32,
+                        )
+                        right_hand_joints = np.asarray(
+                            get_action_field(
+                                processed_action,
+                                "right_dh116s_hand_joints",
+                                aliases=("right_hand_joints",),
+                            ),
+                            dtype=np.float32,
+                        )
+                    else:
+                        left_hand_joints = np.asarray(
+                            get_action_field(processed_action, "left_hand_joints"),
+                            dtype=np.float32,
+                        )
+                        right_hand_joints = np.asarray(
+                            get_action_field(processed_action, "right_hand_joints"),
+                            dtype=np.float32,
+                        )
 
                     # Action arrays arrive as (B, T, D) from the model.
                     # Squeeze batch dim to get (T, D), then index by time step.
@@ -723,12 +932,40 @@ def main(config: InferenceConfig):
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
-                    zmq_message = pack_latent_action_message(
-                        motion_token,
-                        frame_index,
-                        left_hand_joints=left_hand_joints,
-                        right_hand_joints=right_hand_joints,
-                    )
+                    if config.hand_type == "dh116s":
+                        canonical_left_hand = left_hand_joints.copy()
+                        canonical_right_hand = right_hand_joints.copy()
+                        dh116s_left_hand = compose_dh116s_joints(
+                            left_hand_joints,
+                            trigger_close_ratio=config.dh116s_trigger_close_ratio,
+                        )
+                        dh116s_right_hand = compose_dh116s_joints(
+                            right_hand_joints,
+                            trigger_close_ratio=config.dh116s_trigger_close_ratio,
+                        )
+                        if (
+                            canonical_left_hand.reshape(-1).size == 7
+                            and canonical_right_hand.reshape(-1).size == 7
+                        ):
+                            zmq_message = pack_latent_action_message(
+                                motion_token,
+                                frame_index,
+                                left_hand_joints=canonical_left_hand,
+                                right_hand_joints=canonical_right_hand,
+                            )
+                        else:
+                            zmq_message = pack_latent_action_message(
+                                motion_token, frame_index
+                            )
+                        dh116s_hand.send_joints(dh116s_left_hand, dh116s_right_hand)
+                        publish_dh116s_state(zmq_socket, dh116s_hand)
+                    else:
+                        zmq_message = pack_latent_action_message(
+                            motion_token,
+                            frame_index,
+                            left_hand_joints=left_hand_joints,
+                            right_hand_joints=right_hand_joints,
+                        )
                     zmq_socket.send(zmq_message)
                     last_sent_motion_token = motion_token.copy()
                     if zmq_frame_counter % 50 == 0:
@@ -761,6 +998,8 @@ def main(config: InferenceConfig):
         zmq_context.term()
         state_subscriber.close()
         keyboard_listener.close()
+        if dh116s_hand is not None:
+            dh116s_hand.close()
         print("Shutdown complete.")
 
 

@@ -1,7 +1,6 @@
 # copy from g1_43dof_hist.yaml
 ROBOT_TYPE: 'g1_29dof' # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1" 
-ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_41dof_fourier.xml" # Robot scene, for Sim2Sim (29 body + Fourier 6-DoF hands)
-# ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # Dex3 three-finger hands
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # Robot scene, for Sim2Sim
 # ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
 
 DOMAIN_ID: 0 # Domain id
@@ -150,8 +149,8 @@ WeakMotorJointIndex:
 
 NUM_MOTORS: 29
 NUM_JOINTS: 29
-NUM_HAND_MOTORS: 6  # Fourier 6-DoF hand (was 7 for Dex3)
-NUM_HAND_JOINTS: 6  # actuated joints per hand; coupled mimic joints are not commanded
+NUM_HAND_MOTORS: 7
+NUM_HAND_JOINTS: 7
 NUM_UPPER_BODY_JOINTS: 17
 
 DEFAULT_DOF_ANGLES: [
@@ -242,12 +241,12 @@ motor_vel_limit_list: [32.0, 32.0, 32.0, 20.0, 37.0, 37.0,
 motor_effort_limit_list: [88.0, 88.0, 88.0, 139.0, 50.0, 50.0, 
                         88.0, 88.0, 88.0, 139.0, 50.0, 50.0, 
                         88.0, 50.0, 50.0,
-                        25.0, 25.0, 25.0, 25.0,
+                        25.0, 25.0, 25.0, 25.0, 
                         25.0, 5.0, 5.0,
-                        1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                        25.0, 25.0, 25.0, 25.0,
+                        2.45, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7,
+                        25.0, 25.0, 25.0, 25.0, 
                         25.0, 5.0, 5.0,
-                        1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+                        2.45, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
 history_config: {
                   base_ang_vel: 4,
                   projected_gravity: 4,

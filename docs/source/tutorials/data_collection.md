@@ -9,7 +9,7 @@ Everything runs **offboard on your workstation** except the **camera server**, w
 
 ```{admonition} Supported cameras
 :class: note
-The tested and supported camera setup uses **Luxonis OAK cameras** (OAK-D, OAK-1, etc.). This includes a head/ego-view OAK camera and optional OAK wrist cameras. Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently.
+The camera server supports **Luxonis OAK cameras** and the tested robot setup with a **Unitree SV1-25 stereo ego camera plus two UVC wrist cameras**. A RealSense driver is also included.
 ```
 
 ```{admonition} Prerequisites
@@ -29,7 +29,7 @@ On your **workstation** (where you run the C++ deployment, teleop, and data expo
 bash install_scripts/install_data_collection.sh
 ```
 
-This creates `.venv_data_collection` using Python 3.10 via `uv`. It installs `gear_sonic[data_collection]` which includes `lerobot`, `av`, `opencv-python`, and other required packages. It also installs `espeak` (system package) for voice feedback during recording.
+This creates `.venv_data_collection` using Python 3.10 via `uv`. It installs `gear_sonic[data_collection]` which includes `lerobot`, `av`, `opencv-python`, and other required packages. Voice feedback defaults to the G1 robot speaker when the Unitree SDK2 Python audio client is available; the optional `local` backend uses `espeak`.
 
 ```{tip}
 This environment is separate from `.venv_teleop` and `.venv_sim` — the data exporter has heavier ML dependencies that are not needed for teleop or simulation.
@@ -41,7 +41,7 @@ This environment is separate from `.venv_teleop` and `.venv_sim` — the data ex
 
 The camera server is the **only component that runs on the robot computer** (e.g., Jetson Orin). Everything else — the C++ deployment, PICO teleop streamer, data exporter, and camera viewer — runs on your workstation.
 
-The camera server captures frames from the OAK cameras physically connected to the robot and publishes them over ZMQ to the workstation.
+The camera server captures frames from cameras physically connected to the robot and publishes them over ZMQ to the workstation.
 
 ### Step 1: Clone the repo on the robot
 
@@ -78,8 +78,33 @@ journalctl -u composed_camera_server.service -f
 ```
 
 ```{note}
-Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently for data collection. If you need RealSense, install `pyrealsense2` into the venv after setup. See the driver files in `gear_sonic/camera/drivers/` for details.
+The RealSense driver is included but has not been tested recently for data collection. Install `pyrealsense2` into the camera environment before using it.
 ```
+
+### Unitree SV1-25 with wrist cameras
+
+The SV1-25 requires Unitree's lightweight V2 SDK once at startup to unlock UVC
+streaming. Build the helper and start the three-camera configuration with:
+
+```sh
+bash install_scripts/install_sv1_camera_sdk.sh
+bash install_scripts/run_sv1_camera_server.sh
+```
+
+The launcher uses stable `/dev/v4l/by-id` paths rather than `/dev/videoN`, since
+numeric video nodes can change after reconnects. Its defaults are:
+
+| Logical stream | Camera | Default device |
+|---|---|---|
+| `ego_view` | Unitree SV1-25, physical left eye | `usb-USB2.0_Camera_RGB_...-video-index0` |
+| `left_wrist` | TSTC USB20 | `usb-TSTC_USB20_WEB_CAMERA_...-video-index0` |
+| `right_wrist` | H65 USB | `usb-H65_USB_CAMERA_...-video-index0` |
+
+SV1 raw frames are packed as `[physical right][physical left]`. The driver selects
+the physical left eye by default and publishes a full-frame `640x480` RGB image.
+Set `SV1_EYE=right` before running the launcher to select the other eye. The head
+camera must be configured as `ego_view`, because the VLA and dataset schemas use
+that key.
 
 ### Manual setup (alternative)
 
@@ -277,7 +302,9 @@ Common options:
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
-| `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
+| `--no-text-to-speech` | *(on)* | Disable voice feedback |
+| `--text-to-speech-backend` | `robot` | Voice feedback backend: robot speaker, local espeak, or both |
+| `--robot-tts-network-interface` | *(auto)* | G1 speaker DDS interface; omit to auto-detect `192.168.123.x` |
 
 Run `python gear_sonic/scripts/launch_data_collection.py --help` for all options.
 
@@ -432,7 +459,9 @@ Key options:
 | `--state-zmq-host` | `localhost` | Robot state publisher host |
 | `--state-zmq-port` | `5557` | Robot state publisher port |
 | `--root-output-dir` | `outputs` | Root directory for saved datasets |
-| `--text-to-speech / --no-text-to-speech` | `True` | Voice feedback via espeak |
+| `--text-to-speech / --no-text-to-speech` | `True` | Voice feedback |
+| `--text-to-speech-backend` | `robot` | Voice feedback backend: robot speaker, local espeak, or both |
+| `--robot-tts-network-interface` | *(auto)* | G1 speaker DDS interface; omit to auto-detect `192.168.123.x` |
 
 ---
 

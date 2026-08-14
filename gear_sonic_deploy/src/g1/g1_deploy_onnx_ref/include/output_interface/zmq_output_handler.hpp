@@ -137,9 +137,12 @@ public:
         std::cout << "Binding to port: " << port << " and topic: " << topic_ << std::endl;
         realtime_debug_socket_ = std::make_unique<zmq::socket_t>(realtime_debug_context_, ZMQ_PUB);
 
-        realtime_debug_socket_->set(zmq::sockopt::sndhwm, 10);     // Drop old messages quickly
-        realtime_debug_socket_->set(zmq::sockopt::sndbuf, 32768);   // 32 KB send buffer
-        realtime_debug_socket_->set(zmq::sockopt::linger, 0);       // No lingering on close
+        const int snd_hwm = 10;
+        const int snd_buf = 32768;
+        const int linger = 0;
+        realtime_debug_socket_->setsockopt(ZMQ_SNDHWM, &snd_hwm, sizeof(snd_hwm)); // Drop old messages quickly
+        realtime_debug_socket_->setsockopt(ZMQ_SNDBUF, &snd_buf, sizeof(snd_buf)); // 32 KB send buffer
+        realtime_debug_socket_->setsockopt(ZMQ_LINGER, &linger, sizeof(linger));   // No lingering on close
         realtime_debug_socket_->bind("tcp://*:" + std::to_string(port));
 
         std::cout << "[INFO] Realtime debug socket bound to port: " << port << std::endl;

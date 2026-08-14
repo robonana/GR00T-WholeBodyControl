@@ -1,0 +1,20 @@
+{
+  "host": "unitree1 (192.168.31.127)",
+  "remote_repo_root": "/home/unitree/GR00T-WholeBodyControl-dh116s-clean",
+  "captured_at": "2026-07-22",
+  "hash_algorithm": "SHA256",
+  "sources": [
+    {
+      "path": "gear_sonic/scripts/launch_data_collection.py",
+      "size_bytes": 29837,
+      "sha256": "10CA8B74AE234D146BF909E99ED0A3A4E546A0930FF7D6208C7EF63CAD0C42DA",
+      "enhanced_copy": "pico_human_logging_enhanced/launch_data_collection_enhanced.py"
+    },
+    {
+      "path": "gear_sonic/scripts/pico_manager_thread_server.py",
+      "size_bytes": 112707,
+      "sha256": "67321006750A8912985EA39B105FB1B26E7F6B962A75F7A096786EAFD4E41A4A",
+      "enhanced_copy": "pico_human_logging_enhanced/pico_manager_thread_server_enhanced.py"
+    }
+  ]
+}

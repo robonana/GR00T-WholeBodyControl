@@ -19,12 +19,13 @@ static void run_local_publisher(const std::string &bind_endpoint,
                                 int interval_ms,
                                 bool ramp_prefix)
 {
-  constexpr size_t HEADER_SIZE = 1024;
+  constexpr size_t HEADER_SIZE = 2048;
   
   try {
     zmq::context_t ctx(1);
     zmq::socket_t pub(ctx, zmq::socket_type::pub);
-    pub.set(zmq::sockopt::sndhwm, 10);
+    const int snd_hwm = 10;
+    pub.setsockopt(ZMQ_SNDHWM, &snd_hwm, sizeof(snd_hwm));
     pub.bind(bind_endpoint);
 
     // Give subscribers time to connect
@@ -56,7 +57,7 @@ static void run_local_publisher(const std::string &bind_endpoint,
         fake_positions[j] = static_cast<float>(i) + static_cast<float>(j) * 0.1f;
       }
 
-      // Pack into single frame: [topic_prefix][1024-byte JSON header][fields...]
+      // Pack into single frame: [topic_prefix][2048-byte JSON header][fields...]
       const size_t packed_size = topic.size() + HEADER_SIZE + sizeof(idx) + sizeof(ts_ns) 
                                   + fake_positions.size() * sizeof(float);
       std::vector<unsigned char> packed_data(packed_size, 0);

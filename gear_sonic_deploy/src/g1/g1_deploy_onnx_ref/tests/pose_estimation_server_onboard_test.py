@@ -156,7 +156,7 @@ class PoseEstimationServer:
     def _pack_pose_message(self, pose_data: Dict, topic: str = "pose") -> bytes:
         """
         Pack pose data into single-frame format:
-        [topic_prefix][1024-byte JSON header][concatenated binary fields]
+        [topic_prefix][2048-byte JSON header][concatenated binary fields]
         
         Args:
             pose_data: Dictionary containing numpy arrays to send
@@ -165,7 +165,7 @@ class PoseEstimationServer:
         Returns:
             Packed message as bytes
         """
-        HEADER_SIZE = 1024
+        HEADER_SIZE = 2048
         
         # Build fields list from pose_data
         fields = []
@@ -213,7 +213,7 @@ class PoseEstimationServer:
         if len(header_json) >= HEADER_SIZE:
             raise ValueError(f"JSON header too large: {len(header_json)} >= {HEADER_SIZE}")
         
-        # Pack message: [topic][1024-byte header][binary data]
+        # Pack message: [topic][2048-byte header][binary data]
         topic_bytes = topic.encode('utf-8')
         header_bytes = header_json.encode('utf-8').ljust(HEADER_SIZE, b'\x00')
         data_bytes = b''.join(binary_data)

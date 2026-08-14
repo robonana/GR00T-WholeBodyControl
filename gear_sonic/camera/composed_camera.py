@@ -11,7 +11,7 @@ Usage (on robot)::
         --ego-view-device-id 18443010E1ABC12300 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``sv1``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 import cv2  # noqa: F401 — imported early to avoid TSL segfault with camera SDKs
 import numpy as np
@@ -53,10 +53,10 @@ class ComposedCameraConfig:
     """Camera configuration for the composed camera server."""
 
     ego_view_camera: str | None = "oak"
-    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
+    """Camera type for ego view: oak, oak_mono, realsense, sv1, usb, or None."""
 
     ego_view_device_id: str | None = None
-    """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
+    """Device ID or stable /dev/v4l path for the ego-view camera."""
 
     head_camera: str | None = None
     """Camera type for head view."""
@@ -75,6 +75,15 @@ class ComposedCameraConfig:
 
     right_wrist_device_id: str | None = None
     """Device ID for right wrist camera."""
+
+    wrist_width: int = 640
+    """Published width for USB wrist cameras."""
+
+    wrist_height: int = 480
+    """Published height for USB wrist cameras."""
+
+    wrist_fps: int = 30
+    """Capture rate for USB wrist cameras; keep equal to the server publish rate."""
 
     fps: int = 30
     """Publish rate.  OAK cameras run at 30 FPS; lower values add latency."""
@@ -100,6 +109,27 @@ class ComposedCameraConfig:
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
+    sv1_eye: Literal["left", "right"] = "left"
+    """Physical SV1-25 eye published as the ego-view image."""
+
+    sv1_raw_width: int = 1856
+    """SV1-25 packed stereo input width. Use 1856 for full-resolution stereo."""
+
+    sv1_raw_height: int = 800
+    """SV1-25 packed stereo input height. Use 800 for full-resolution stereo."""
+
+    sv1_output_width: int = 928
+    """Published width of one cropped SV1 eye."""
+
+    sv1_output_height: int = 800
+    """Published height of one cropped SV1 eye."""
+
+    sv1_fps: int = 30
+    """SV1-25 capture frame rate."""
+
+    sv1_streamer_path: str | None = None
+    """Optional path to the persistent Unitree SV1 native streamer."""
+
     def __post_init__(self):
         self.run_as_server = self.server
 
@@ -115,6 +145,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        self._latest_camera_frames: dict[str, dict[str, Any]] = {}
 
         camera_configs = self._get_camera_configs()
 
@@ -378,6 +409,27 @@ class ComposedCameraSensor(Sensor, SensorServer):
             print(f"Initializing RealSense sensor for camera type: {camera_type}")
             return RealSenseSensor(mount_position=mount_position)
 
+        elif camera_type == "sv1":
+            from gear_sonic.camera.drivers.sv1 import SV1CameraConfig, SV1CameraSensor
+
+            sv1_config = SV1CameraConfig(
+                eye=self.config.sv1_eye,
+                raw_width=self.config.sv1_raw_width,
+                raw_height=self.config.sv1_raw_height,
+                output_dim=(self.config.sv1_output_width, self.config.sv1_output_height),
+                fps=self.config.sv1_fps,
+                streamer_path=self.config.sv1_streamer_path,
+            )
+            print(
+                f"Initializing SV1 sensor for {mount_position}: "
+                f"device={device_id or sv1_config.device_path}, eye={sv1_config.eye}"
+            )
+            return SV1CameraSensor(
+                config=sv1_config,
+                mount_position=mount_position,
+                device_path=device_id,
+            )
+
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
 
@@ -387,11 +439,23 @@ class ComposedCameraSensor(Sensor, SensorServer):
         elif camera_type == "usb":
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
 
-            usb_config = USBCameraConfig()
-            device_idx = int(device_id) if device_id else 0
-            print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
+            if mount_position in {
+                CameraMountPosition.LEFT_WRIST.value,
+                CameraMountPosition.RIGHT_WRIST.value,
+            }:
+                usb_config = USBCameraConfig(
+                    image_dim=(self.config.wrist_width, self.config.wrist_height),
+                    fps=self.config.wrist_fps,
+                )
+            else:
+                usb_config = USBCameraConfig()
+            if device_id and device_id.lstrip("-").isdigit():
+                device = int(device_id)
+            else:
+                device = device_id or 0
+            print(f"Initializing USB camera for type: {camera_type}, device: {device}")
             return USBCameraSensor(
-                config=usb_config, mount_position=mount_position, device_index=device_idx
+                config=usb_config, mount_position=mount_position, device_index=device
             )
 
         else:
@@ -406,19 +470,18 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 raise RuntimeError(error_msg)
 
     def read(self):
-        """Read frames from all cameras. Returns None unless ALL cameras have frames."""
+        """Read the latest frame from each camera, reusing cached side-camera frames."""
         self._check_for_errors()
 
         expected_cameras = set(self.camera_queues.keys())
-        message = {}
 
         for mount_position, camera_queue in self.camera_queues.items():
             frame = self._get_latest_from_queue(camera_queue)
             if frame is not None:
-                message[mount_position] = frame
+                self._latest_camera_frames[mount_position] = frame
 
-        if set(message.keys()) == expected_cameras:
-            return message
+        if set(self._latest_camera_frames.keys()) == expected_cameras:
+            return dict(self._latest_camera_frames)
         return None
 
     def _get_latest_from_queue(self, camera_queue: queue.Queue) -> dict[str, Any] | None:
@@ -677,8 +740,11 @@ if __name__ == "__main__":
 
     if config.run_as_server:
         composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
+        try:
+            print("Running composed camera server...")
+            composed_camera.run_server()
+        finally:
+            composed_camera.close()
     else:
         composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
         try:

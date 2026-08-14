@@ -17,7 +17,12 @@ class VideoWriter:
         fps: float,
         codec: str = "h264",
         buffer_size: int = 50,
+        crf: int = 18,
+        preset: str = "veryfast",
+        pixel_format: str = "yuv420p",
     ):
+        if not 0 <= crf <= 51:
+            raise ValueError(f"H.264 CRF must be in [0, 51], got {crf}")
         self.output_path = output_path
         self._first_frame = True
 
@@ -27,9 +32,18 @@ class VideoWriter:
 
         self.queue = queue.Queue(maxsize=buffer_size)
         self.container = av.open(output_path, mode="w")
-        self.stream = self.container.add_stream(codec, rate=fps)
+        self.stream = self.container.add_stream(
+            codec,
+            rate=fps,
+            options={"crf": str(crf), "preset": preset},
+        )
         self.stream.width = width
         self.stream.height = height
+        self.stream.pix_fmt = pixel_format
+        print(
+            f"[VideoWriter] {output_path}: {width}x{height}@{fps:g}, "
+            f"codec={codec}, crf={crf}, preset={preset}, pixel_format={pixel_format}"
+        )
         thread = threading.Thread(target=self._writer_worker, daemon=True)
         thread.start()
 

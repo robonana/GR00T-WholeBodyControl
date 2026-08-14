@@ -74,6 +74,45 @@ See [Data Collection](data_collection.md) for camera server setup.
 
 The `gear_sonic_deploy` binary must be built. See the main README.
 
+### Low-Latency SONIC WBC
+
+For the low-latency SONIC controller, download the `low_latency/` deployment
+variant from Hugging Face:
+
+```bash
+python download_from_hf.py --low-latency
+```
+
+Then launch `gear_sonic_deploy` with the low-latency model prefix and matching
+observation config:
+
+**C++ deploy:**
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+For simulation, replace `real` with `sim`. The `--cp` value is a model prefix:
+`deploy.sh` appends `_encoder.onnx` and `_decoder.onnx` internally.
+
+**Python launcher:**
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+The Python launcher starts the same C++ deploy command in a tmux pane, then runs
+the Python VLA inference client, keyboard publisher, and optional data exporter.
+
 ## Action Space
 
 The Sonic embodiment (`unitree_g1_sonic`) uses a 78-dimensional action
@@ -131,7 +170,7 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 3. Switch to **pane 1** (Keyboard Publisher)
 4. Press `k` to start the C++ control loop (starts in PLANNER mode)
 5. Press `i` to blend to the initial pose (switches to POSE mode)
-   > The robot smoothly interpolates to the initial pose over 1 second. If your
+   > The robot smoothly interpolates to the initial pose over 3 seconds. If your
    > task starts from a different pose than the default, see
    > [Customizing the Initial Pose](#customizing-the-initial-pose) below.
 6. Press `p` to unpause the inference loop
@@ -158,6 +197,27 @@ uv run python gr00t/eval/run_gr00t_server.py \
 ```bash
 cd gear_sonic_deploy
 ./deploy.sh --input-type zmq_manager real
+```
+
+Low-latency variant:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the apple"
+```
+
+Manual C++ deploy equivalent:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
 ```
 
 ### Terminal 3 — VLA Inference
@@ -196,7 +256,7 @@ python gear_sonic/scripts/run_data_exporter.py \
 | `--rate` | `2.5` | Inference rate (Hz) |
 | `--camera-host` | `localhost` | Camera server host |
 | `--camera-port` | `5555` | Camera server port |
-| `--initial-pose-blend-duration` | `1.0` | Seconds to blend to initial pose (0 = instant snap) |
+| `--initial-pose-blend-duration` | `3.0` | Seconds to blend to initial pose (0 = instant snap) |
 | `--verbose-timing` | `false` | Always print loop timing |
 
 ### tmux Launcher (`launch_inference.py`)
@@ -272,11 +332,11 @@ LATENT_INITIAL_MOTION_TOKEN = np.array(
 The blend duration controls how quickly the robot transitions to the initial pose:
 
 ```bash
-# Default: 1 second smooth blend
-python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 1.0
+# Default: 3 second smooth blend
+python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 3.0
 
-# Faster blend (0.5 seconds)
-python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 0.5
+# Faster blend (1 second)
+python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 1.0
 
 # Instant snap (no interpolation, legacy behavior)
 python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 0
@@ -285,5 +345,5 @@ python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 0
 ```{warning}
 Setting `--initial-pose-blend-duration` too low (or to 0) can cause jerky motion,
 especially if the robot's current pose is far from the initial pose. The default
-1-second blend is safe for most configurations.
+3-second blend is the current default compromise between safety and speed.
 ```

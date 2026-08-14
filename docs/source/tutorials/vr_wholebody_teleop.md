@@ -2,9 +2,14 @@
 
 Full whole-body teleoperation using PICO VR headset and controllers. To teleop, use the option  `--input-type zmq_manager` during deployment. The `zmq_manager` input type switches between a **planner mode** (locomotion commands via ZMQ) and a **streamed motion mode** (full-body SMPL poses from PICO).
 
+```{admonition} Isaac Teleop / CloudXR Scope
+:class: note
+The same `zmq_manager` workflow can also drive the headset through Isaac Teleop / CloudXR by launching `gear_sonic/scripts/pico_manager_thread_server.py --input-source isaac-teleop`. The streamer hosts the CloudXR runtime in-process via `isaacteleop[cloudxr]` — no separate publisher container required. That path is currently supported only for **G1 with a Thor backpack**; a regular G1 setup is not supported yet.
+```
+
 ```{admonition} Safety Warning
 :class: danger
-Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, **`a`** in the PICO manager terminal, or **A+B+X+Y** on the PICO controllers).
+Whole-body teleoperation involves fast, agile motions. **Always** maintain a clear safety zone and keep a safety operator at the keyboard ready to trigger an emergency stop (**`O`** in the C++ terminal, or **A+B+X+Y** on the PICO controllers).
 
 You **must wear tight-fitting pants or leggings** to guarantee line-of-sight for the foot trackers — loose or baggy clothing can make tracking fail unpredictably and may result in dangerous motion.
 ```
@@ -16,8 +21,8 @@ You **must wear tight-fitting pants or leggings** to guarantee line-of-sight for
 
 ## Prerequisites
 
-1. **Completed the [Quick Start](../getting_started/quickstart.md)** — you can run the sim2sim loop.
-2. **Completed the [VR Teleop Setup](../getting_started/vr_teleop_setup.md)** — PICO hardware is installed, calibrated, connected, and `.venv_teleop` is ready.
+1. **Completed the [Quick Start](../getting_started/quickstart.md)** — you can run the sim2sim loop (includes [installing the deployment](../getting_started/installation_deploy.md) and [downloading model checkpoints](../getting_started/download_models.md)).
+2. **Completed the [VR Teleop Setup](../getting_started/vr_teleop_setup.md)** — `.venv_teleop` is ready. For the default path, PICO hardware is installed, calibrated, and connected. For Isaac Teleop / CloudXR, the `isaacteleop[cloudxr]` package is also installed (handled by `install_pico.sh`) and the headset connects to the in-process CloudXR runtime — see [Isaac Teleop Setup](isaac_teleop_publisher_setup.md).
 
 ---
 
@@ -47,6 +52,21 @@ source scripts/setup_env.sh
 # Wait until you see "Init done"
 ```
 
+**Isaac Teleop / CloudXR alternative** (**G1 + Thor backpack only**) — run the C++ deployment from the project's ROS2 docker container instead of bare metal:
+
+```bash
+cd gear_sonic_deploy
+export TensorRT_ROOT=$HOME/TensorRT   # only if not already in ~/.bashrc
+./docker/run-ros2-dev.sh
+
+# inside the container (setup_env.sh is sourced automatically):
+just build                                  # first run only
+./deploy.sh --input-type zmq_manager sim
+# Wait until you see "Init done"
+```
+
+See [Installation (Deployment) → Docker (ROS2 Development Environment)](../getting_started/installation_deploy.md) for details on `run-ros2-dev.sh` and `TensorRT_ROOT`.
+
 ```{note}
 The `--zmq-host` flag defaults to `localhost`, which is correct when both C++ deployment scripts and teleop scripts (Terminal 3) run on the same machine. If the teleop script runs on a different machine, pass `--zmq-host <IP-of-teleop-machine>`.
 ```
@@ -66,39 +86,27 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager \
 # python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
 
-If you are using a vendored Fourier FDH-6 hand setup driven directly from XR
-hand tracking, launch the same streamer with:
+**Isaac Teleop / CloudXR alternative** (**G1 + Thor backpack only**) — connects the headset over CloudXR (no XRoboToolKit PC service required); the streamer launches the CloudXR runtime in-process via `isaacteleop[cloudxr]`:
 
 ```bash
 source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
+
+python gear_sonic/scripts/pico_manager_thread_server.py --manager \
+    --input-source isaac-teleop
+
+# If running offboard with a display, add visualization:
+#   --vis_vr3pt --vis_smpl
 ```
 
-`pybind11` and `dexhandpy` are required only for the Fourier hand path. If you
-are using standard PICO whole-body teleoperation without Fourier hands, you can
-skip those two installs.
-
-Optional debugging flags:
-
-```bash
-# Print landmark-distance / 6-DoF action summaries
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_debug
-
-# Validate the full pipeline without sending Fourier SDK commands
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_sim
-```
-
-When you turn on the visualization, wait for a window to pop up showing a Unitree G1 mesh with all joints at the default angles. If no window shows up, double-check the PICO's XRoboToolKit IP configuration in the [VR Teleop Setup](../getting_started/vr_teleop_setup.md).
+When you turn on the visualization, wait for a window to pop up showing a Unitree G1 mesh with all joints at the default angles. If no window shows up on the default PICO path, double-check the PICO's XRoboToolKit IP configuration in the [VR Teleop Setup](../getting_started/vr_teleop_setup.md). If you are using Isaac Teleop instead, verify the headset is connected to the in-process CloudXR runtime — see [Isaac Teleop Setup](isaac_teleop_publisher_setup.md) for connection steps.
 
 ### Your First Teleop Session
 
 1. **Assume the calibration pose** — stand upright, feet together, upper arms at your sides, forearms bent 90° forward (L-shape at each elbow), palms inward. See [Calibration Pose](#calibration-pose) for details.
-2. Press **A + B + X + Y** or keyboard **`a`** to engage the control policy and run the initial full calibration (`CALIB_FULL`).
-3. Align your arms with the robot's current pose, then press **A + X** or keyboard **`b`** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
-4. Press **A + X** or keyboard **`b`** again to fall back to **PLANNER** (idle) mode.
-5. Press **A + B + X + Y** or keyboard **`a`** again to stop the robot.
+2. Press **A + B + X + Y** simultaneously to engage the control policy and run the initial full calibration (`CALIB_FULL`).
+3. Align your arms with the robot's current pose, then press **A + X** to enter full-body SMPL teleop (**POSE** mode). Move your arms and legs — the robot follows.
+4. Press **A + X** again to fall back to **PLANNER** (idle) mode.
+5. Press **A + B + X + Y** again to stop the robot.
 
 <figure style="margin: 1em 0;">
 <video width="100%" autoplay loop muted playsinline style="border-radius: 8px;">
@@ -115,18 +123,17 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 
 ### Modes & Calibration
 
-The teleop manager uses **6 runtime states** and **2 calibration types**.
+The system has **4 operating modes** and **2 calibration types**.
 
 **Modes:**
 
 | Mode | Encoder | Description |
 |---|---|---|
-| **OFF** | -- | Policy not running. Stand in [calibration pose](#calibration-pose), then press **A+B+X+Y** or keyboard **`a`** to start policy. |
-| **POSE** | SMPL | Whole-body teleop — streaming the SMPL pose from PICO to the C++ deployment side. Your motion maps directly to the robot. |
+| **OFF** | -- | Policy not running. Stand in [calibration pose](#calibration-pose), then press **A+B+X+Y** to start policy. |
+| **POSE** | SMPL | Whole-body teleop — streaming the SMPL pose from PICO to the C++ deployment side. Your motion will directly map to the robot .|
 | **PLANNER** | G1 | Locomotion planner active; upper body controller by planner. Joysticks control direction and heading in walking and running modes. |
 | **PLANNER_FROZEN_UPPER** | G1 | Planner locomotion; upper body frozen at last POSE snapshot. |
 | **VR_3PT** | TELEOP | Planner locomotion; upper body follows VR 3-point tracking (head + 2 hands). Depends on non-IK-based VR 3-point calibration. |
-| **POSE_PAUSE** | SMPL | Temporary pause entered by holding the **left menu** button while in `POSE`; release the button to resume `POSE`. |
 
 **Calibration types** (non-IK workflow for minimal latency):
 
@@ -137,7 +144,7 @@ The teleop manager uses **6 runtime states** and **2 calibration types**.
 
 ### State Machine
 
-The main teleop flow has 5 user-facing modes (`OFF`, `POSE`, `PLANNER`, `PLANNER_FROZEN_UPPER`, `VR_3PT`) plus a transient `POSE_PAUSE` state. Each chain forms a triangle: **A+X** (or **B+Y**) returns to `POSE` from both the planner node and its `VR_3PT` sub-mode.
+There are 4 modes and 2 control chains. Each chain forms a triangle: **A+X** (or **B+Y**) returns to POSE from *both* the planner node and its VR_3PT sub-mode.
 
 ```text
   ┌──────────────────────────────────────┐
@@ -234,13 +241,11 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 
 | Action | Button | Notes |
 |---|---|---|
-| **Start / Stop policy** | **A+B+X+Y** or keyboard **`a`** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. Keyboard `a` is handled by the `pico_manager_thread_server.py` terminal. |
-| **Toggle POSE** | **A+X** or keyboard **`b`** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. Keyboard `b` is handled by the `pico_manager_thread_server.py` terminal. |
+| **Start / Stop policy** | **A+B+X+Y** | First press: engage + CALIB_FULL. Again: emergency stop → OFF. |
+| **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
-| **Pause POSE** | **Hold Left Menu** | Enters `POSE_PAUSE` while the button is held; releasing it returns to `POSE`. |
-| **Hand grasp** | **Trigger** (per hand) | Legacy `--hand_mode trigger` only. |
-| **Fourier hand control** | **XR hand tracking** | In `--hand_mode fourier`, the FDH-6 hands are driven directly from XR hand landmarks instead of controller triggers. |
+| **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
 
 ### Joystick Controls (Planner Modes)
 
@@ -278,7 +283,6 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 | Method | Action |
 |---|---|
 | **PICO controllers** | Press **A+B+X+Y** simultaneously → OFF |
-| **Manager terminal** | Press keyboard **`a`** in the `pico_manager_thread_server.py` terminal → OFF |
 | **Keyboard** (C++ terminal) | Press **`O`** for immediate stop |
 
 ---
@@ -308,6 +312,19 @@ source scripts/setup_env.sh
 # Wait until you see "Init done"
 ```
 
+**Isaac Teleop / CloudXR alternative** (**G1 + Thor backpack only**) — run the C++ deployment from the project's ROS2 docker container instead of bare metal:
+
+```bash
+cd gear_sonic_deploy
+export TensorRT_ROOT=$HOME/TensorRT   # only if not already in ~/.bashrc
+./docker/run-ros2-dev.sh
+
+# inside the container (setup_env.sh is sourced automatically):
+just build                                   # first run only
+./deploy.sh --input-type zmq_manager real
+# Wait until you see "Init done"
+```
+
 ```{note}
 If the teleop script (Terminal 2) runs on a different machine, add `--zmq-host <IP-of-teleop-machine>` so the C++ side knows where the ZMQ publisher is.
 ```
@@ -317,6 +334,8 @@ If the teleop script (Terminal 2) runs on a different machine, add `--zmq-host <
 From the **repo root**:
 
 ```bash
+# bash install_scripts/install_pico.sh
+
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
 
@@ -324,28 +343,15 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 #   --vis_vr3pt --vis_smpl
 ```
 
-If you are using Fourier FDH-6 hands on the real robot, start the same
-manager with:
+**Isaac Teleop / CloudXR alternative** (**G1 + Thor backpack only**) — in-process CloudXR runtime via `isaacteleop[cloudxr]`, no XRoboToolKit PC service required:
 
 ```bash
 source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
-```
-
-For Fourier hand debugging or dry-run validation:
-
-```bash
-# Print periodic XR landmark / 6-DoF summaries
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_debug
-
-# Keep the full pipeline active without sending dexhand SDK commands
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier --fourier_sim
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --input-source isaac-teleop
 ```
 
 ```{note}
-Update the IP in the PICO's XRoboToolKit app to match this machine before starting.
+Update the IP in the PICO's XRoboToolKit app to match this machine before starting the default PICO path. For Isaac Teleop, make sure the headset is connected to the in-process CloudXR runtime — see [Isaac Teleop Setup](isaac_teleop_publisher_setup.md).
 ```
 
-Follow the same start sequence: calibration pose → **A+B+X+Y** or keyboard **`a`** → **A+X** or keyboard **`b`** for `POSE` mode. See [Complete PICO Controls](#pico-controls) for all available commands.
+Follow the same start sequence: calibration pose → **A+B+X+Y** → **A+X** for POSE mode. See [Complete PICO Controls](#pico-controls) for all available commands.

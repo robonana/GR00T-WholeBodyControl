@@ -28,7 +28,7 @@ A typical whole-body teleoperation session follows this workflow:
 
 **Terminal 1 — MuJoCo Simulator** (or skip for real robot):
 ```bash
-source .venv_sim/bin/activate
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py
 ```
 
@@ -47,36 +47,14 @@ source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager 
 ```
 
-For Fourier FDH-6 hand teleoperation, use:
-
-```bash
-source .venv_teleop/bin/activate
-pip install pybind11
-pip install dexhandpy
-python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier
-```
-
-This Fourier path is now vendored inside this repository. It no longer depends
-on an external `xr_teleoperate` checkout at runtime.
-
 **Operator Actions**:
 1. **Put on PICO headset and controllers** — Ensure foot trackers are securely attached. 
 2. **Stand in calibration pose** — Upright, feet together, arms in down. Recalibrate often!!!
 3. **Make robot stand loose but standing** - Put the G1 somehow slack on gantry (the policy will start and start balancing on its own). 
-4. **Press A+B+X+Y** on controllers, or keyboard **`a`** in the PICO manager terminal — Initializes the policy and calibrates (enters Planner mode)
-5. **Press A+X** on controllers, or keyboard **`b`** in the PICO manager terminal — Switches to Pose mode (whole-body teleoperation active)
+4. **Press A+B+X+Y** on controllers — Initializes the policy and calibrates (enters Planner mode)
+5. **Press A+X** — Switches to Pose mode (whole-body teleoperation active)
 6. **Teleoperate** — Your movements are now mirrored by the robot
-7. **Press A+B+X+Y** again, or keyboard **`a`** in the PICO manager terminal, when done — Emergency stop and exit. Policy will stop!!!
-
-If you want to run a hybrid setup with **MuJoCo body simulation + real Fourier
-hands**, use:
-
-- **Terminal 1**: `.venv_sim` for `run_sim_loop.py`
-- **Terminal 2**: `gear_sonic_deploy` with `./deploy.sh --input-type zmq_manager sim`
-- **Terminal 3**: `.venv_teleop` with `python gear_sonic/scripts/pico_manager_thread_server.py --manager --hand_mode fourier`
-
-In that setup, the body motion is executed in MuJoCo while the FDH-6 hands are
-driven directly from XR hand tracking on the real hardware.
+7. **Press A+B+X+Y** when done — Emergency stop and exit. Policy will stop!!!
 
 ## Clothing Requirements
 

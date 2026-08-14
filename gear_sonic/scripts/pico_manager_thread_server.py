@@ -12,10 +12,6 @@
     # VR3 PT visualization only (without SMPL body) — lower latency
     python pico_manager_thread_server.py --manager --vis_vr3pt
 
-    # Fourier dexterous hand control from XR hand tracking.
-    python pico_manager_thread_server.py --manager \
-        --hand_mode fourier
-
 # DEBUG VR3 PT VISUALIZATION:
     # A standalone test mode that captures one live frame and visualizes it.
     python pico_manager_thread_server.py --vr3pt_live
@@ -28,25 +24,11 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
-import inspect
 import os
-from pathlib import Path
-import select
+import signal
 import subprocess
-import sys
 import threading
 import time
-
-try:
-    import termios
-    import tty
-except ImportError:
-    termios = None
-    tty = None
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 import msgpack
 import numpy as np
@@ -54,6 +36,8 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
+from gear_sonic.utils.latency_logging import CsvLatencyLogger
+from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -64,6 +48,63 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+
+
+PICO_READER_LATENCY_FIELDS = (
+    "unix_time_s",
+    "reader_sequence",
+    "device_timestamp_ns",
+    "device_dt_ms",
+    "device_fps_ema",
+    "host_interarrival_ms",
+    "availability_query_ms",
+    "timestamp_query_ms",
+    "get_body_joints_pose_ms",
+    "numpy_copy_ms",
+    "publish_lock_ms",
+    "reader_total_ms",
+)
+
+POSE_PIPELINE_LATENCY_FIELDS = (
+    "unix_time_s",
+    "loop_index",
+    "outcome",
+    "reader_sequence",
+    "device_timestamp_ns",
+    "device_dt_ms",
+    "device_fps_ema",
+    "device_stamp_delta_ms",
+    "estimated_input_frames_skipped",
+    "sample_age_at_loop_start_ms",
+    "sample_age_at_send_ms",
+    "loop_start_interval_ms",
+    "manager_outside_pose_ms",
+    "get_latest_ms",
+    "compute_body_pose_ms",
+    "controller_input_ms",
+    "hand_ik_ms",
+    "dh116s_target_ms",
+    "dh116s_actual_read_ms",
+    "tensor_to_numpy_ms",
+    "interpolation_ms",
+    "wrist_joint_transform_ms",
+    "three_point_pose_ms",
+    "buffer_append_ms",
+    "joystick_ms",
+    "numpy_message_build_ms",
+    "zmq_pack_ms",
+    "zmq_send_ms",
+    "record_ms",
+    "processing_total_ms",
+    "scheduled_sleep_ms",
+    "loop_total_ms",
+    "buffer_frames",
+    "message_bytes",
+)
+
+
+def _elapsed_ms(start_monotonic: float) -> float:
+    return (time.monotonic() - start_monotonic) * 1000.0
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -104,6 +145,12 @@ except ImportError:
     G1GripperInverseKinematicsSolver = None
 
 try:
+    from gear_sonic.utils.teleop.solver.hand.dh116s_hand_driver import DH116SHandDriver
+except ImportError:
+    print("Warning: DH116SHandDriver not available.")
+    DH116SHandDriver = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -114,18 +161,6 @@ try:
 except ImportError:
     print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
-
-try:
-    from gear_sonic.utils.teleop.solver.hand.fourier_hand_driver import FourierHandDriver
-except ImportError:
-    print("Warning: FourierHandDriver not available.")
-    FourierHandDriver = None
-
-try:
-    from gear_sonic.utils.teleop.solver.hand.dh116s_hand_driver import DH116SHandDriver
-except ImportError:
-    print("Warning: DH116SHandDriver not available.")
-    DH116SHandDriver = None
 
 
 class LocomotionMode(IntEnum):
@@ -162,6 +197,12 @@ class StreamMode(Enum):
     PLANNER_VR_3PT = 5
 
 
+HAND_MODE_TRIGGER = "trigger"
+HAND_MODE_DH116S_TRACKING = "dh116s"
+HAND_MODE_DH116S_TRIGGER = "dh116s_trigger"
+DH116S_HAND_MODES = {HAND_MODE_DH116S_TRACKING, HAND_MODE_DH116S_TRIGGER}
+
+
 ### Parse 3 point pose from SMPL
 #
 # OFFSETS: Rotation corrections applied to each keypoint to align SMPL joint frames
@@ -195,99 +236,6 @@ OFFSETS = [
     ),  # R-Wrist: roll -90° about fixed X, then yaw 180° about fixed Z
     sRot.from_euler("xyz", [0, 0, -90], degrees=True),  # Neck: yaw -90° about fixed Z
 ]
-
-XR_HAND_JOINT_COUNT = 26
-UNITY_TO_ROBOT_ROT = np.array([[-1, 0, 0], [0, 0, 1], [0, 1, 0.0]], dtype=np.float32)
-T_ROBOT_OPENXR = np.array(
-    [[0, 0, -1, 0], [-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float32
-)
-T_OPENXR_ROBOT = np.array(
-    [[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float32
-)
-T_TO_UNITREE_HAND = np.array(
-    [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=np.float32
-)
-T_TO_UNITREE_HAND_ROT = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float32)
-FOURIER_ZERO_ACTION = np.zeros(6, dtype=np.float32)
-DH116S_ZERO_ACTION = np.zeros(6, dtype=np.float32)
-HAND_MODE_TRIGGER = "trigger"
-HAND_MODE_FOURIER_TRACKING = "fourier"
-HAND_MODE_FOURIER_TRIGGER = "fourier_trigger"
-HAND_MODE_DH116S_TRACKING = "dh116s"
-HAND_MODE_DH116S_TRIGGER = "dh116s_trigger"
-FOURIER_HAND_MODES = {HAND_MODE_FOURIER_TRACKING, HAND_MODE_FOURIER_TRIGGER}
-DH116S_HAND_MODES = {HAND_MODE_DH116S_TRACKING, HAND_MODE_DH116S_TRIGGER}
-
-
-class KeyboardHotkeyBridge:
-    """Background terminal hotkeys for manager control without extra dependencies."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._pending = {"a": 0, "b": 0}
-        self._stop_event = threading.Event()
-        self._thread = None
-        self._stdin_fd = None
-        self._old_termios = None
-        self.enabled = False
-
-        if termios is None or tty is None:
-            print("[KeyboardHotkeys] Disabled: termios/tty unavailable")
-            return
-        if not sys.stdin or not sys.stdin.isatty():
-            print("[KeyboardHotkeys] Disabled: stdin is not a TTY")
-            return
-
-        try:
-            self._stdin_fd = sys.stdin.fileno()
-            self._old_termios = termios.tcgetattr(self._stdin_fd)
-            tty.setcbreak(self._stdin_fd)
-            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self._thread.start()
-            self.enabled = True
-        except Exception as exc:
-            print(f"[KeyboardHotkeys] Disabled: {exc}")
-            self.close()
-
-    def _reader_loop(self) -> None:
-        assert self._stdin_fd is not None
-        while not self._stop_event.is_set():
-            try:
-                ready, _, _ = select.select([self._stdin_fd], [], [], 0.05)
-                if not ready:
-                    continue
-                chars = os.read(self._stdin_fd, 32)
-                if not chars:
-                    continue
-                with self._lock:
-                    for ch in chars.decode("utf-8", errors="ignore").lower():
-                        if ch in self._pending:
-                            self._pending[ch] += 1
-            except Exception:
-                break
-
-    def consume(self, key: str) -> bool:
-        """Return True once per queued keypress event."""
-        normalized = key.lower()
-        with self._lock:
-            count = self._pending.get(normalized, 0)
-            if count <= 0:
-                return False
-            self._pending[normalized] = count - 1
-            return True
-
-    def close(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=0.2)
-        if self._stdin_fd is not None and self._old_termios is not None:
-            try:
-                termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._old_termios)
-            except Exception:
-                pass
-        self._thread = None
-        self._stdin_fd = None
-        self._old_termios = None
 
 
 def _compute_rel_transform(pose, world_frame, scalar_first=True):
@@ -730,52 +678,26 @@ def init_hand_ik_solvers():
     return None, None
 
 
-def init_fourier_hand_driver(
-    hand_mode: str,
-    fourier_simulation_mode: bool = False,
-):
-    """Initialize the optional Fourier hand driver."""
-    if hand_mode not in FOURIER_HAND_MODES:
-        return None
-    if FourierHandDriver is None:
-        raise ImportError(
-            f"FourierHandDriver unavailable but hand_mode='{hand_mode}' was requested."
+# Readers that expose `get_controller_data()` returning the IsaacTeleop
+# controller_data dict schema (left/right trigger/squeeze, thumbstick, clicks).
+# Tuple form keeps the dispatch sites uniform if/when a second reader speaks
+# the same schema.
+_ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
+
+
+def get_controller_inputs(reader=None):
+    """Fetch controller button/trigger states from XRoboToolkit or IsaacTeleop."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, 0.0, 0.0, 0.0, 0.0
+        return (
+            False,
+            float(ctrl.get("left_trigger_value", 0.0)),
+            float(ctrl.get("right_trigger_value", 0.0)),
+            float(ctrl.get("left_squeeze_value", 0.0)),
+            float(ctrl.get("right_squeeze_value", 0.0)),
         )
-    return FourierHandDriver(
-        simulation_mode=fourier_simulation_mode,
-        enable_retargeting=hand_mode == HAND_MODE_FOURIER_TRACKING,
-    )
-
-
-def init_dh116s_hand_driver(
-    hand_mode: str,
-    dh116s_simulation_mode: bool = False,
-    dh116s_hand_dir: str = "left",
-    dh116s_node_id: int = 1,
-    dh116s_right_node_id: int = 9,
-    dh116s_current: int = 800,
-    dh116s_home_wait_time: float = 2.0,
-):
-    """Initialize the optional DH116S hand driver."""
-    if hand_mode not in DH116S_HAND_MODES:
-        return None
-    if DH116SHandDriver is None:
-        raise ImportError(
-            f"DH116SHandDriver unavailable but hand_mode='{hand_mode}' was requested."
-        )
-    return DH116SHandDriver(
-        simulation_mode=dh116s_simulation_mode,
-        enable_retargeting=hand_mode == HAND_MODE_DH116S_TRACKING,
-        hand_dir=dh116s_hand_dir,
-        canfd_node_id=dh116s_node_id,
-        right_canfd_node_id=dh116s_right_node_id,
-        max_current=dh116s_current,
-        home_wait_time=dh116s_home_wait_time,
-    )
-
-
-def get_controller_inputs():
-    """Fetch controller button/trigger states from XRoboToolkit."""
     left_trigger = xrt.get_left_trigger()
     right_trigger = xrt.get_right_trigger()
     left_grip = xrt.get_left_grip()
@@ -784,114 +706,20 @@ def get_controller_inputs():
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
 
 
-def _hand_tracking_state_to_robot_poses(hand_tracking_state: np.ndarray) -> np.ndarray:
-    """Convert XR hand joint poses from Unity coordinates to robot coordinates."""
-    robot_poses = np.zeros((hand_tracking_state.shape[0], 7), dtype=np.float32)
-    for i in range(hand_tracking_state.shape[0]):
-        pose = hand_tracking_state[i]
-        robot_poses[i, :3] = UNITY_TO_ROBOT_ROT @ pose[:3]
-        rot = sRot.from_quat(pose[3:7]).as_matrix()
-        rel_rot = sRot.from_matrix(UNITY_TO_ROBOT_ROT @ rot @ UNITY_TO_ROBOT_ROT.T)
-        quat_xyzw = rel_rot.as_quat()
-        robot_poses[i, 3:] = np.array(
-            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]],
-            dtype=np.float32,
-        )
-    return robot_poses
-
-
-def _fast_mat_inv(mat: np.ndarray) -> np.ndarray:
-    inv = np.eye(4, dtype=np.float32)
-    inv[:3, :3] = mat[:3, :3].T
-    inv[:3, 3] = -mat[:3, :3].T @ mat[:3, 3]
-    return inv
-
-
-def _pose7_to_mat_openxr(pose: np.ndarray) -> np.ndarray:
-    mat = np.eye(4, dtype=np.float32)
-    mat[:3, :3] = sRot.from_quat(pose[3:7]).as_matrix().astype(np.float32)
-    mat[:3, 3] = pose[:3].astype(np.float32)
-    return mat
-
-
-def _hand_tracking_state_to_unitree_landmarks_wrist_local(
-    hand_tracking_state: np.ndarray,
-) -> np.ndarray:
-    """Convert 26 XR hand joints into wrist-local 25-point landmarks."""
-    if hand_tracking_state.shape != (XR_HAND_JOINT_COUNT, 7):
-        raise ValueError(
-            f"Expected hand tracking state shape {(XR_HAND_JOINT_COUNT, 7)}, got {hand_tracking_state.shape}"
-        )
-
-    # XR/OpenXR uses 26 joints with palm at index 0 and wrist at index 1.
-    # xr_teleoperate expects the 25-joint layout with wrist at index 0.
-    robot_poses = _hand_tracking_state_to_robot_poses(hand_tracking_state)
-    wrist_pose = robot_poses[1]
-    wrist_rot = sRot.from_quat(wrist_pose[[4, 5, 6, 3]])
-    local_positions = wrist_rot.inv().apply(robot_poses[1:, :3] - wrist_pose[:3])
-    return (local_positions @ T_TO_UNITREE_HAND_ROT.T).astype(np.float32)
-
-
-def _hand_tracking_state_to_unitree_landmarks_openxr_arm_frame(
-    hand_tracking_state: np.ndarray,
-) -> np.ndarray:
-    """Match xr_teleoperate's OpenXR -> robot basis -> arm frame -> Unitree hand chain."""
-    if hand_tracking_state.shape != (XR_HAND_JOINT_COUNT, 7):
-        raise ValueError(
-            f"Expected hand tracking state shape {(XR_HAND_JOINT_COUNT, 7)}, got {hand_tracking_state.shape}"
-        )
-
-    # OpenXR 26 joints: palm + wrist + 24 finger joints.
-    hand_positions_openxr = hand_tracking_state[1:, :3].astype(np.float32)
-    hand_positions_openxr_h = np.concatenate(
-        [hand_positions_openxr.T, np.ones((1, hand_positions_openxr.shape[0]), dtype=np.float32)],
-        axis=0,
-    )
-    hand_positions_robot_world = T_ROBOT_OPENXR @ hand_positions_openxr_h
-
-    wrist_pose_openxr = _pose7_to_mat_openxr(hand_tracking_state[1])
-    wrist_pose_robot_world = T_ROBOT_OPENXR @ wrist_pose_openxr @ T_OPENXR_ROBOT
-
-    hand_positions_robot_arm = _fast_mat_inv(wrist_pose_robot_world) @ hand_positions_robot_world
-    return (T_TO_UNITREE_HAND @ hand_positions_robot_arm)[:3, :].T.astype(np.float32)
-
-
-def _hand_tracking_state_to_unitree_landmarks(
-    hand_tracking_state: np.ndarray,
-    coord_mode: str,
-) -> np.ndarray:
-    if coord_mode == "openxr_arm_frame":
-        return _hand_tracking_state_to_unitree_landmarks_openxr_arm_frame(hand_tracking_state)
-    if coord_mode == "wrist_local":
-        return _hand_tracking_state_to_unitree_landmarks_wrist_local(hand_tracking_state)
-    raise ValueError(f"Unknown Fourier coord mode: {coord_mode}")
-
-
-def get_hand_tracking_landmarks(coord_mode: str = "openxr_arm_frame"):
-    """Fetch left/right 25-point hand landmarks in the Unitree hand convention."""
-    if xrt is None:
-        return None, None, False, False
-
-    try:
-        left_active = bool(xrt.get_left_hand_is_active())
-        right_active = bool(xrt.get_right_hand_is_active())
-
-        left_landmarks = None
-        right_landmarks = None
-        if left_active:
-            left_state = np.asarray(xrt.get_left_hand_tracking_state(), dtype=np.float32)
-            left_landmarks = _hand_tracking_state_to_unitree_landmarks(left_state, coord_mode)
-        if right_active:
-            right_state = np.asarray(xrt.get_right_hand_tracking_state(), dtype=np.float32)
-            right_landmarks = _hand_tracking_state_to_unitree_landmarks(right_state, coord_mode)
-        return left_landmarks, right_landmarks, left_active, right_active
-    except Exception as exc:
-        print(f"[HandTracking] failed to fetch landmarks: {exc}")
-        return None, None, False, False
-
-
-def get_controller_axes():
+def get_controller_axes(reader=None):
     """Fetch joystick axes (lx, ly, rx, ry). Falls back to zeros if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return 0.0, 0.0, 0.0, 0.0
+        left_thumbstick = ctrl.get("left_thumbstick", [0.0, 0.0])
+        right_thumbstick = ctrl.get("right_thumbstick", [0.0, 0.0])
+        return (
+            float(left_thumbstick[0]),
+            float(left_thumbstick[1]),
+            float(right_thumbstick[0]),
+            float(right_thumbstick[1]),
+        )
     if xrt is None:
         return 0.0, 0.0, 0.0, 0.0
     try:
@@ -906,8 +734,10 @@ def get_controller_axes():
         return 0.0, 0.0, 0.0, 0.0
 
 
-def get_menu_buttons():
+def get_menu_buttons(reader=None):
     """Fetch both menu buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        return False, False
     if xrt is None:
         return False, False
 
@@ -923,8 +753,16 @@ def get_menu_buttons():
     return left, right
 
 
-def get_axis_clicks():
+def get_axis_clicks(reader=None):
     """Fetch both axis click buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("left_thumbstick_click", 0.0)) > 0.5,
+            float(ctrl.get("right_thumbstick_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
 
@@ -940,8 +778,16 @@ def get_axis_clicks():
     return left, right
 
 
-def get_face_buttons():
+def get_face_buttons(reader=None):
     """Fetch primary face buttons A and X. Returns (a_pressed, x_pressed)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
     try:
@@ -952,8 +798,18 @@ def get_face_buttons():
         return False, False
 
 
-def get_abxy_buttons():
+def get_abxy_buttons(reader=None):
     """Fetch A,B,X,Y face buttons as booleans (a,b,x,y)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False, False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("right_secondary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_secondary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False, False, False
     try:
@@ -981,202 +837,55 @@ def compute_hand_joints_from_inputs(
     return left_hand_joints, right_hand_joints
 
 
-def compute_fourier_hand_joints_from_tracking(
-    hand_driver,
-    coord_mode: str = "openxr_arm_frame",
+def init_dh116s_hand_driver(
+    hand_mode: str,
+    dh116s_simulation_mode: bool = False,
+    dh116s_hand_dir: str = "double",
+    dh116s_node_id: int = 1,
+    dh116s_right_node_id: int = 1,
+    dh116s_left_device_index: int = 1,
+    dh116s_right_device_index: int = 0,
+    dh116s_current: int = 1000,
+    dh116s_home_wait_time: float = 2.0,
+    dh116s_trigger_close_ratio: float = 0.5,
+    dh116s_debug: bool = False,
 ):
-    """Update the Fourier hand controller from XR hand tracking and return the latest 6-DoF targets."""
-    if hand_driver is None:
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy(), None, None
+    if hand_mode not in DH116S_HAND_MODES:
+        return None
+    if DH116SHandDriver is None:
+        raise ImportError(f"DH116SHandDriver unavailable but hand_mode='{hand_mode}' was requested")
+    return DH116SHandDriver(
+        simulation_mode=dh116s_simulation_mode,
+        enable_retargeting=hand_mode == HAND_MODE_DH116S_TRACKING,
+        hand_dir=dh116s_hand_dir,
+        canfd_node_id=dh116s_node_id,
+        right_canfd_node_id=dh116s_right_node_id,
+        left_device_index=dh116s_left_device_index,
+        right_device_index=dh116s_right_device_index,
+        max_current=dh116s_current,
+        home_wait_time=dh116s_home_wait_time,
+        trigger_close_ratio=dh116s_trigger_close_ratio,
+        debug=dh116s_debug,
+    )
 
-    try:
-        left_landmarks, right_landmarks, _, _ = get_hand_tracking_landmarks(coord_mode)
-        hand_driver.update_landmarks(left_landmarks, right_landmarks)
-        left_action, right_action = hand_driver.get_latest_action()
-        return left_action, right_action, left_landmarks, right_landmarks
-    except Exception as exc:
-        print(f"[FourierHandDriver] tracking update failed: {exc}")
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy(), None, None
 
-
-def compute_fourier_hand_joints_from_triggers(
+def compute_dh116s_hand_joints_from_triggers(
     hand_driver,
     left_trigger: float,
     right_trigger: float,
-):
-    """Update Fourier hands from Pico trigger values and return the latest 6-DoF targets."""
+) -> tuple[np.ndarray, np.ndarray]:
     if hand_driver is None:
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-
-    try:
-        hand_driver.update_trigger_inputs(left_trigger, right_trigger)
-        return hand_driver.get_latest_action()
-    except Exception as exc:
-        print(f"[FourierHandDriver] trigger update failed: {exc}")
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-
-
-def get_fourier_hand_actual_joints(hand_driver, refresh: bool = False):
-    """Return latest Fourier get_pos() feedback in hardware joint order/radians."""
-    if hand_driver is None:
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-
-    try:
-        if refresh:
-            refresh_state = getattr(hand_driver, "refresh_state", None)
-            if callable(refresh_state):
-                return refresh_state()
-        return hand_driver.get_latest_state()
-    except Exception as exc:
-        print(f"[FourierHandDriver] state read failed: {exc}")
-        return FOURIER_ZERO_ACTION.copy(), FOURIER_ZERO_ACTION.copy()
-
-
-def compute_dh116s_hand_joints_from_tracking(
-    hand_driver,
-    coord_mode: str = "openxr_arm_frame",
-):
-    """Update the DH116S hand controller from XR hand tracking and return the latest targets."""
-    if hand_driver is None:
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy(), None, None
-
-    try:
-        left_landmarks, right_landmarks, _, _ = get_hand_tracking_landmarks(coord_mode)
-        hand_driver.update_landmarks(left_landmarks, right_landmarks)
-        left_action, right_action = hand_driver.get_latest_action()
-        return left_action, right_action, left_landmarks, right_landmarks
-    except Exception as exc:
-        print(f"[DH116SHandDriver] tracking update failed: {exc}")
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy(), None, None
-
-
-def compute_dh116s_hand_joints_from_triggers(hand_driver, left_trigger: float, right_trigger: float):
-    """Update DH116S hand from Pico trigger values and return the latest targets."""
-    if hand_driver is None:
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy()
-
-    try:
-        hand_driver.update_trigger_inputs(left_trigger, right_trigger)
-        return hand_driver.get_latest_action()
-    except Exception as exc:
-        print(f"[DH116SHandDriver] trigger update failed: {exc}")
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy()
+        return np.zeros(6, dtype=np.float32), np.zeros(6, dtype=np.float32)
+    hand_driver.update_trigger_inputs(left_trigger, right_trigger)
+    return hand_driver.get_latest_action()
 
 
 def get_dh116s_hand_actual_joints(hand_driver, refresh: bool = False):
-    """Return latest DH116S feedback in hardware joint order/radians."""
     if hand_driver is None:
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy()
-
-    try:
-        if refresh:
-            refresh_state = getattr(hand_driver, "refresh_state", None)
-            if callable(refresh_state):
-                return refresh_state()
-        return hand_driver.get_latest_state()
-    except Exception as exc:
-        print(f"[DH116SHandDriver] state read failed: {exc}")
-        return DH116S_ZERO_ACTION.copy(), DH116S_ZERO_ACTION.copy()
-
-
-class FourierHandDebug:
-    def __init__(self, enabled: bool = False):
-        self.enabled = enabled
-        self._last_log = 0.0
-
-    def maybe_log(
-        self,
-        coord_mode: str,
-        left_landmarks: np.ndarray | None,
-        right_landmarks: np.ndarray | None,
-        left_action: np.ndarray,
-        right_action: np.ndarray,
-    ) -> None:
-        if not self.enabled:
-            return
-        now = time.time()
-        if now - self._last_log < 2.0:
-            return
-        self._last_log = now
-
-        def _tip_distance(hand: np.ndarray | None, a: int, b: int) -> float:
-            if hand is None or hand.shape[0] <= max(a, b):
-                return float("nan")
-            return float(np.linalg.norm(hand[a] - hand[b]))
-
-        print(
-            "[FourierDebug] "
-            f"coord_mode={coord_mode} "
-            f"L(thumb-index={_tip_distance(left_landmarks, 4, 9):.4f}, "
-            f"thumb-middle={_tip_distance(left_landmarks, 4, 14):.4f}, "
-            f"action={np.round(left_action, 4).tolist()}) "
-            f"R(thumb-index={_tip_distance(right_landmarks, 4, 9):.4f}, "
-            f"thumb-middle={_tip_distance(right_landmarks, 4, 14):.4f}, "
-            f"action={np.round(right_action, 4).tolist()})"
-        )
-
-    def maybe_log_trigger(
-        self,
-        left_trigger: float,
-        right_trigger: float,
-        left_action: np.ndarray,
-        right_action: np.ndarray,
-    ) -> None:
-        if not self.enabled:
-            return
-        now = time.time()
-        if now - self._last_log < 2.0:
-            return
-        self._last_log = now
-        print(
-            "[FourierTriggerDebug] "
-            f"L(trigger={left_trigger:.3f}, action={np.round(left_action, 4).tolist()}) "
-            f"R(trigger={right_trigger:.3f}, action={np.round(right_action, 4).tolist()})"
-        )
-
-
-class DH116SHandDebug(FourierHandDebug):
-    def maybe_log(self, coord_mode, left_landmarks, right_landmarks, left_action, right_action) -> None:
-        if not self.enabled:
-            return
-        now = time.time()
-        if now - self._last_log < 2.0:
-            return
-        self._last_log = now
-
-        def _tip_distance(hand: np.ndarray | None, a: int, b: int) -> float:
-            if hand is None or hand.shape[0] <= max(a, b):
-                return float("nan")
-            return float(np.linalg.norm(hand[a] - hand[b]))
-
-        print(
-            "[DH116SDebug] "
-            f"coord_mode={coord_mode} "
-            f"L(thumb-index={_tip_distance(left_landmarks, 4, 9):.4f}, "
-            f"action={np.round(left_action, 4).tolist()}) "
-            f"R(thumb-index={_tip_distance(right_landmarks, 4, 9):.4f}, "
-            f"action={np.round(right_action, 4).tolist()})"
-        )
-
-    def maybe_log_trigger(self, left_trigger, right_trigger, left_action, right_action) -> None:
-        if not self.enabled:
-            return
-        now = time.time()
-        if now - self._last_log < 2.0:
-            return
-        self._last_log = now
-        print(
-            "[DH116STriggerDebug] "
-            f"L(trigger={left_trigger:.3f}, action={np.round(left_action, 4).tolist()}) "
-            f"R(trigger={right_trigger:.3f}, action={np.round(right_action, 4).tolist()})"
-        )
-
-
-def build_planner_message_compat(**kwargs) -> bytes:
-    """Call build_planner_message while tolerating older installed signatures."""
-    sig = inspect.signature(build_planner_message)
-    supported = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    return build_planner_message(**supported)
+        return np.zeros(6, dtype=np.float32), np.zeros(6, dtype=np.float32)
+    if refresh:
+        return hand_driver.refresh_state()
+    return hand_driver.get_latest_state()
 
 
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -1224,6 +933,11 @@ class PicoReader:
         self._last_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
+        self._reader_sequence = 0
+        self._last_frame_monotonic = None
+        self._latency_logger = CsvLatencyLogger(
+            "pico_reader_latency.csv", PICO_READER_LATENCY_FIELDS
+        )
 
     def start(self):
         self._thread.start()
@@ -1231,18 +945,37 @@ class PicoReader:
     def stop(self):
         self._stop.set()
         self._thread.join(timeout=1.0)
+        self._latency_logger.close()
 
     def get_latest(self):
         with self._lock:
             return self._latest
 
+    @property
+    def disconnected(self) -> bool:
+        return False
+
+    def clear_disconnect(self):
+        pass
+
+    def get_timestamp_ns(self) -> int:
+        if xrt is None:
+            return 0
+        return int(xrt.get_time_stamp_ns())
+
     def _run(self):
         last_report = time.time()
         while not self._stop.is_set():
-            if not xrt.is_body_data_available():
+            availability_started = time.monotonic()
+            body_data_available = xrt.is_body_data_available()
+            availability_query_ms = _elapsed_ms(availability_started)
+            if not body_data_available:
                 time.sleep(0.001)
                 continue
+            reader_started = time.monotonic()
+            timestamp_query_started = time.monotonic()
             stamp_ns = xrt.get_time_stamp_ns()
+            timestamp_query_ms = _elapsed_ms(timestamp_query_started)
             prev_stamp_ns = self._last_stamp_ns
             if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
                 time.sleep(0.000001)
@@ -1255,19 +988,51 @@ class PicoReader:
             self._last_stamp_ns = stamp_ns
             t_realtime = time.time()
             t_monotonic = time.monotonic()
+            host_interarrival_ms = (
+                (t_monotonic - self._last_frame_monotonic) * 1000.0
+                if self._last_frame_monotonic is not None
+                else None
+            )
+            self._last_frame_monotonic = t_monotonic
             try:
+                body_pose_started = time.monotonic()
                 body_poses = xrt.get_body_joints_pose()
+                get_body_joints_pose_ms = _elapsed_ms(body_pose_started)
+
+                numpy_copy_started = time.monotonic()
+                body_poses_np = np.array(body_poses)
+                numpy_copy_ms = _elapsed_ms(numpy_copy_started)
+                self._reader_sequence += 1
 
                 sample = {
-                    "body_poses_np": np.array(body_poses),
+                    "body_poses_np": body_poses_np,
                     "timestamp_realtime": t_realtime,
                     "timestamp_monotonic": t_monotonic,
                     "timestamp_ns": stamp_ns,
                     "dt": device_dt,
                     "fps": self._fps_ema,
+                    "reader_sequence": self._reader_sequence,
                 }
+                publish_started = time.monotonic()
                 with self._lock:
                     self._latest = sample
+                publish_lock_ms = _elapsed_ms(publish_started)
+                self._latency_logger.write(
+                    {
+                        "unix_time_s": time.time(),
+                        "reader_sequence": self._reader_sequence,
+                        "device_timestamp_ns": stamp_ns,
+                        "device_dt_ms": device_dt * 1000.0,
+                        "device_fps_ema": self._fps_ema,
+                        "host_interarrival_ms": host_interarrival_ms,
+                        "availability_query_ms": availability_query_ms,
+                        "timestamp_query_ms": timestamp_query_ms,
+                        "get_body_joints_pose_ms": get_body_joints_pose_ms,
+                        "numpy_copy_ms": numpy_copy_ms,
+                        "publish_lock_ms": publish_lock_ms,
+                        "reader_total_ms": _elapsed_ms(reader_started),
+                    }
+                )
                 now = time.time()
                 if now - last_report >= 5.0:
                     print(
@@ -1292,27 +1057,20 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
-    hand_mode: str = "trigger",
-    fourier_coord_mode: str = "openxr_arm_frame",
-    fourier_debug: bool = False,
-    fourier_simulation_mode: bool = False,
-    dh116s_debug: bool = False,
-    dh116s_simulation_mode: bool = False,
-    dh116s_hand_dir: str = "left",
-    dh116s_node_id: int = 1,
-    dh116s_right_node_id: int = 9,
-    dh116s_current: int = 800,
-    dh116s_home_wait_time: float = 2.0,
+    reader=None,
+    hand_mode: str = HAND_MODE_TRIGGER,
+    dh116s_hand_driver=None,
 ):
     """Shared pose streaming loop used by run_pico."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
-        )
+    if reader is None:
+        if xrt is None:
+            raise ImportError(
+                "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
+            )
 
-    # Create reader and start it
-    reader = PicoReader(max_queue_size=buffer_size)
-    reader.start()
+        # Create reader and start it
+        reader = PicoReader(max_queue_size=buffer_size)
+        reader.start()
 
     # Create 3-point pose processor with visualization settings
     three_point = ThreePointPose(
@@ -1322,36 +1080,6 @@ def _pose_stream_common(
         enable_smpl_vis=enable_smpl_vis,
         log_prefix=log_prefix,
     )
-    fourier_hand_driver = init_fourier_hand_driver(
-        hand_mode=hand_mode,
-        fourier_simulation_mode=fourier_simulation_mode,
-    )
-    dh116s_hand_driver = init_dh116s_hand_driver(
-        hand_mode=hand_mode,
-        dh116s_simulation_mode=dh116s_simulation_mode,
-        dh116s_hand_dir=dh116s_hand_dir,
-        dh116s_node_id=dh116s_node_id,
-        dh116s_right_node_id=dh116s_right_node_id,
-        dh116s_current=dh116s_current,
-        dh116s_home_wait_time=dh116s_home_wait_time,
-    )
-    if hand_mode == HAND_MODE_FOURIER_TRACKING:
-        print(
-            f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
-            "(recommended: openxr_arm_frame)"
-        )
-    elif hand_mode == HAND_MODE_FOURIER_TRIGGER:
-        print("[FourierHandDriver] trigger mode: Pico L/R triggers drive Fourier hands")
-    elif hand_mode == HAND_MODE_DH116S_TRACKING:
-        print(
-            f"[DH116SHandDriver] coord_mode={fourier_coord_mode} "
-            f"hand_dir={dh116s_hand_dir} left_node_id={dh116s_node_id} right_node_id={dh116s_right_node_id}"
-        )
-    elif hand_mode == HAND_MODE_DH116S_TRIGGER:
-        print(
-            f"[DH116SHandDriver] trigger mode: Pico triggers drive DH116S "
-            f"hand_dir={dh116s_hand_dir} left_node_id={dh116s_node_id} right_node_id={dh116s_right_node_id}"
-        )
 
     streamer = PoseStreamer(
         socket=socket,
@@ -1362,20 +1090,9 @@ def _pose_stream_common(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
-        hand_mode=hand_mode,
-        fourier_coord_mode=fourier_coord_mode,
-        fourier_debug=fourier_debug,
-        fourier_simulation_mode=fourier_simulation_mode,
-        fourier_hand_driver=fourier_hand_driver,
-        dh116s_debug=dh116s_debug,
-        dh116s_simulation_mode=dh116s_simulation_mode,
-        dh116s_hand_dir=dh116s_hand_dir,
-        dh116s_node_id=dh116s_node_id,
-        dh116s_right_node_id=dh116s_right_node_id,
-        dh116s_current=dh116s_current,
-        dh116s_home_wait_time=dh116s_home_wait_time,
-        dh116s_hand_driver=dh116s_hand_driver,
         log_prefix=log_prefix,
+        hand_mode=hand_mode,
+        dh116s_hand_driver=dh116s_hand_driver,
     )
 
     if stop_event is None:
@@ -1388,10 +1105,9 @@ def _pose_stream_common(
         pass
     finally:
         # Cleanup resources
+        streamer.close()
         reader.stop()
         three_point.close()
-        if fourier_hand_driver is not None:
-            fourier_hand_driver.close()
 
 
 class ThreePointPose:
@@ -1696,27 +1412,16 @@ class PoseStreamer:
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         num_frames_to_send: int,
         target_fps: int,
         use_cuda: bool,
         record_dir: str,
         record_format: str,
-        hand_mode: str = "trigger",
-        fourier_coord_mode: str = "openxr_arm_frame",
-        fourier_debug: bool = False,
-        fourier_simulation_mode: bool = False,
-        fourier_hand_driver=None,
-        dh116s_debug: bool = False,
-        dh116s_simulation_mode: bool = False,
-        dh116s_hand_dir: str = "left",
-        dh116s_node_id: int = 1,
-        dh116s_right_node_id: int = 9,
-        dh116s_current: int = 800,
-        dh116s_home_wait_time: float = 2.0,
-        dh116s_hand_driver=None,
         log_prefix: str = "PoseLoop",
+        hand_mode: str = HAND_MODE_TRIGGER,
+        dh116s_hand_driver=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1724,6 +1429,8 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.hand_mode = hand_mode
+        self.dh116s_hand_driver = dh116s_hand_driver
 
         # Injected dependencies
         self.reader = reader
@@ -1737,27 +1444,7 @@ class PoseStreamer:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
 
-        self.hand_mode = hand_mode
-        self.fourier_coord_mode = fourier_coord_mode
-        self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
-        self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
-            hand_mode=hand_mode,
-            fourier_simulation_mode=fourier_simulation_mode,
-        )
-        self.dh116s_debug = DH116SHandDebug(enabled=dh116s_debug)
-        self.dh116s_hand_driver = dh116s_hand_driver or init_dh116s_hand_driver(
-            hand_mode=hand_mode,
-            dh116s_simulation_mode=dh116s_simulation_mode,
-            dh116s_hand_dir=dh116s_hand_dir,
-            dh116s_node_id=dh116s_node_id,
-            dh116s_right_node_id=dh116s_right_node_id,
-            dh116s_current=dh116s_current,
-            dh116s_home_wait_time=dh116s_home_wait_time,
-        )
-        if hand_mode == HAND_MODE_TRIGGER:
-            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
-        else:
-            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
         self.parent_indices = [
             -1,
             0,
@@ -1809,6 +1496,39 @@ class PoseStreamer:
             True  # Start with buffer cleared - wait for full buffer before first send
         )
         self.yaw_accumulator = YawAccumulator()
+        self._latency_loop_index = 0
+        self._last_latency_loop_start = None
+        self._last_latency_loop_end = None
+        self._latency_logger = CsvLatencyLogger(
+            "pose_pipeline_latency.csv", POSE_PIPELINE_LATENCY_FIELDS
+        )
+
+    def close(self):
+        self._latency_logger.close()
+
+    def _finish_latency_row(
+        self,
+        timing: dict[str, object],
+        outcome: str,
+        loop_started: float,
+        *,
+        processing_finished: float | None = None,
+        scheduled_sleep_ms: float = 0.0,
+    ) -> None:
+        finished = time.monotonic()
+        if processing_finished is None:
+            processing_finished = finished
+        timing.update(
+            {
+                "outcome": outcome,
+                "processing_total_ms": (processing_finished - loop_started) * 1000.0,
+                "scheduled_sleep_ms": scheduled_sleep_ms,
+                "loop_total_ms": (finished - loop_started) * 1000.0,
+                "buffer_frames": len(self.frame_buffer["frame_index"]),
+            }
+        )
+        self._last_latency_loop_end = finished
+        self._latency_logger.write(timing)
 
     def reset_yaw(self):
         """Called when entering pose mode. Resets yaw only.
@@ -1827,20 +1547,62 @@ class PoseStreamer:
 
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
+        loop_started = time.monotonic()
+        self._latency_loop_index += 1
+        timing: dict[str, object] = {
+            "unix_time_s": time.time(),
+            "loop_index": self._latency_loop_index,
+        }
+        if self._last_latency_loop_start is not None:
+            timing["loop_start_interval_ms"] = (
+                loop_started - self._last_latency_loop_start
+            ) * 1000.0
+        if self._last_latency_loop_end is not None:
+            timing["manager_outside_pose_ms"] = (
+                loop_started - self._last_latency_loop_end
+            ) * 1000.0
+        self._last_latency_loop_start = loop_started
+        stage_started = time.monotonic()
         sample = self.reader.get_latest()
+        timing["get_latest_ms"] = _elapsed_ms(stage_started)
 
         if sample is None:
+            sleep_started = time.monotonic()
             time.sleep(0.005)
+            self._finish_latency_row(
+                timing,
+                "no_sample",
+                loop_started,
+                processing_finished=sleep_started,
+                scheduled_sleep_ms=_elapsed_ms(sleep_started),
+            )
             return
 
+        timing.update(
+            {
+                "reader_sequence": sample.get("reader_sequence"),
+                "device_timestamp_ns": sample.get("timestamp_ns"),
+                "device_dt_ms": float(sample.get("dt", 0.0)) * 1000.0,
+                "device_fps_ema": sample.get("fps"),
+                "sample_age_at_loop_start_ms": max(
+                    0.0,
+                    (loop_started - float(sample.get("timestamp_monotonic", loop_started)))
+                    * 1000.0,
+                ),
+            }
+        )
+        stage_started = time.monotonic()
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
         )
-        (left_menu_button, left_trigger, right_trigger, left_grip, right_grip) = (
-            get_controller_inputs()
+        timing["compute_body_pose_ms"] = _elapsed_ms(stage_started)
+        stage_started = time.monotonic()
+        left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
+            self.reader
         )
         # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
+        timing["controller_input_ms"] = _elapsed_ms(stage_started)
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
@@ -1854,73 +1616,24 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
-        right_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
-        left_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
-        right_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
-        left_hand_dh116s_joints = DH116S_ZERO_ACTION.copy()
-        right_hand_dh116s_joints = DH116S_ZERO_ACTION.copy()
-        left_hand_dh116s_actual_joints = DH116S_ZERO_ACTION.copy()
-        right_hand_dh116s_actual_joints = DH116S_ZERO_ACTION.copy()
-
-        if self.hand_mode == HAND_MODE_FOURIER_TRACKING:
+        stage_started = time.monotonic()
+        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
+        )
+        timing["hand_ik_ms"] = _elapsed_ms(stage_started)
+        left_hand_dh116s_joints = np.zeros(6, dtype=np.float32)
+        right_hand_dh116s_joints = np.zeros(6, dtype=np.float32)
+        left_hand_dh116s_actual_joints = np.zeros(6, dtype=np.float32)
+        right_hand_dh116s_actual_joints = np.zeros(6, dtype=np.float32)
+        if self.hand_mode in DH116S_HAND_MODES:
             left_hand_joints = np.zeros((1, 7), dtype=np.float32)
             right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            left_hand_fourier_joints, right_hand_fourier_joints, left_landmarks, right_landmarks = (
-                compute_fourier_hand_joints_from_tracking(
-                    self.fourier_hand_driver, self.fourier_coord_mode
-                )
-            )
-            self.fourier_debug.maybe_log(
-                self.fourier_coord_mode,
-                left_landmarks,
-                right_landmarks,
-                left_hand_fourier_joints,
-                right_hand_fourier_joints,
-            )
-            left_hand_fourier_actual_joints, right_hand_fourier_actual_joints = (
-                get_fourier_hand_actual_joints(self.fourier_hand_driver)
-            )
-        elif self.hand_mode == HAND_MODE_FOURIER_TRIGGER:
-            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            left_hand_fourier_joints, right_hand_fourier_joints = (
-                compute_fourier_hand_joints_from_triggers(
-                    self.fourier_hand_driver,
-                    left_trigger,
-                    right_trigger,
-                )
-            )
-            self.fourier_debug.maybe_log_trigger(
-                left_trigger,
-                right_trigger,
-                left_hand_fourier_joints,
-                right_hand_fourier_joints,
-            )
-            left_hand_fourier_actual_joints, right_hand_fourier_actual_joints = (
-                get_fourier_hand_actual_joints(self.fourier_hand_driver)
-            )
-        elif self.hand_mode == HAND_MODE_DH116S_TRACKING:
-            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            left_hand_dh116s_joints, right_hand_dh116s_joints, left_landmarks, right_landmarks = (
-                compute_dh116s_hand_joints_from_tracking(
-                    self.dh116s_hand_driver, self.fourier_coord_mode
-                )
-            )
-            self.dh116s_debug.maybe_log(
-                self.fourier_coord_mode,
-                left_landmarks,
-                right_landmarks,
-                left_hand_dh116s_joints,
-                right_hand_dh116s_joints,
-            )
-            left_hand_dh116s_actual_joints, right_hand_dh116s_actual_joints = (
-                get_dh116s_hand_actual_joints(self.dh116s_hand_driver)
-            )
-        elif self.hand_mode == HAND_MODE_DH116S_TRIGGER:
-            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            stage_started = time.monotonic()
             left_hand_dh116s_joints, right_hand_dh116s_joints = (
                 compute_dh116s_hand_joints_from_triggers(
                     self.dh116s_hand_driver,
@@ -1928,28 +1641,16 @@ class PoseStreamer:
                     right_trigger,
                 )
             )
-            self.dh116s_debug.maybe_log_trigger(
-                left_trigger,
-                right_trigger,
-                left_hand_dh116s_joints,
-                right_hand_dh116s_joints,
-            )
+            timing["dh116s_target_ms"] = _elapsed_ms(stage_started)
+            stage_started = time.monotonic()
             left_hand_dh116s_actual_joints, right_hand_dh116s_actual_joints = (
                 get_dh116s_hand_actual_joints(self.dh116s_hand_driver)
             )
+            timing["dh116s_actual_read_ms"] = _elapsed_ms(stage_started)
         else:
-            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-                self.left_hand_ik_solver,
-                self.right_hand_ik_solver,
-                left_trigger,
-                left_grip,
-                right_trigger,
-                right_grip,
-            )
-            left_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
-            right_hand_fourier_joints = FOURIER_ZERO_ACTION.copy()
-            left_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
-            right_hand_fourier_actual_joints = FOURIER_ZERO_ACTION.copy()
+            timing["dh116s_target_ms"] = 0.0
+            timing["dh116s_actual_read_ms"] = 0.0
+        stage_started = time.monotonic()
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1959,6 +1660,7 @@ class PoseStreamer:
         body_quat_np = (
             latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
         )
+        timing["tensor_to_numpy_ms"] = _elapsed_ms(stage_started)
         curr_stamp_ns = int(sample.get("timestamp_ns", 0))
         step_ns = int(1e9 / max(1, self.target_fps))
         if self.prev_stamp_ns is None:
@@ -1967,15 +1669,24 @@ class PoseStreamer:
             self.prev_smpl_joints_np = smpl_joints_np
             self.prev_body_quat_np = body_quat_np
             self.next_target_ns = curr_stamp_ns
+            self._finish_latency_row(timing, "initialize_timestamp", loop_started)
             return
+        stamp_delta_ns = curr_stamp_ns - self.prev_stamp_ns
+        timing["device_stamp_delta_ms"] = stamp_delta_ns / 1e6
+        timing["estimated_input_frames_skipped"] = max(
+            0, int(round(stamp_delta_ns / max(1, step_ns))) - 1
+        )
         if curr_stamp_ns <= self.prev_stamp_ns:
+            self._finish_latency_row(timing, "duplicate_timestamp", loop_started)
             return
         if self.next_target_ns is None:
             self.next_target_ns = self.prev_stamp_ns + step_ns
         if self.next_target_ns < self.prev_stamp_ns:
             self.next_target_ns = self.prev_stamp_ns
         if self.next_target_ns > curr_stamp_ns:
+            self._finish_latency_row(timing, "target_timestamp_not_ready", loop_started)
             return
+        stage_started = time.monotonic()
         denom = float(curr_stamp_ns - self.prev_stamp_ns)
         alpha = float(self.next_target_ns - self.prev_stamp_ns) / denom if denom > 0.0 else 1.0
         if alpha < 0.0:
@@ -1989,9 +1700,11 @@ class PoseStreamer:
         use_body_quat = _quat_lerp_normalized(self.prev_body_quat_np, body_quat_np, alpha).astype(
             np.float32
         )
+        timing["interpolation_ms"] = _elapsed_ms(stage_started)
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
+        stage_started = time.monotonic()
         joint_pos = np.zeros(29)
         body_pose = use_pose.reshape(-1, 21, 3)
 
@@ -2050,9 +1763,11 @@ class PoseStreamer:
         joint_pos[G1_R_WRIST_ROLL_IDX] = g1_r_wrist_roll[0]
         joint_pos[G1_R_WRIST_PITCH_IDX] = g1_r_wrist_pitch[0]
         joint_pos[G1_R_WRIST_YAW_IDX] = g1_r_wrist_yaw[0]
+        timing["wrist_joint_transform_ms"] = _elapsed_ms(stage_started)
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer
+        stage_started = time.monotonic()
         smpl_joints_for_vis = (
             latest_data["smpl_joints_local"].detach().cpu().numpy()[0]
             if self.three_point.enable_smpl_vis
@@ -2061,8 +1776,10 @@ class PoseStreamer:
         vr_3pt_pose = self.three_point.process_smpl_pose(
             sample["body_poses_np"], smpl_joints_local=smpl_joints_for_vis
         )
+        timing["three_point_pose_ms"] = _elapsed_ms(stage_started)
         ##### From @Jiefeng for directly setting the joint position ######
 
+        stage_started = time.monotonic()
         self.frame_buffer["smpl_pose"].append(use_pose)
         self.frame_buffer["smpl_joints"].append(use_joints)
         self.frame_buffer["body_quat_w"].append(use_body_quat)
@@ -2071,6 +1788,7 @@ class PoseStreamer:
         pico_dt = float(sample.get("dt", 0.0))
         pico_fps = float(sample.get("fps", 0.0))
         N = len(self.frame_buffer["frame_index"])
+        timing["buffer_append_ms"] = _elapsed_ms(stage_started)
 
         # Wait for buffer to be completely filled before sending first message after clearing
         buffer_is_full = len(self.frame_buffer["frame_index"]) >= self.num_frames_to_send
@@ -2079,11 +1797,15 @@ class PoseStreamer:
             self.buffer_cleared = False
 
         # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes()
+        stage_started = time.monotonic()
+        _, _, rx, _ = get_controller_axes(self.reader)
         self.yaw_accumulator.update(rx, self.frame_time)
+        timing["joystick_ms"] = _elapsed_ms(stage_started)
 
         # Only send if buffer is full and we're not waiting for fresh data
+        outcome = "buffer_warmup"
         if buffer_is_full and not self.buffer_cleared:
+            stage_started = time.monotonic()
             numpy_data = {
                 "smpl_pose": np.stack((self.frame_buffer["smpl_pose"]), axis=0),
                 "smpl_joints": np.stack((self.frame_buffer["smpl_joints"]), axis=0),
@@ -2107,55 +1829,47 @@ class PoseStreamer:
                 ),
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
+                "left_hand_dh116s_joints": left_hand_dh116s_joints.astype(np.float32),
+                "right_hand_dh116s_joints": right_hand_dh116s_joints.astype(np.float32),
+                "left_hand_dh116s_actual_joints": left_hand_dh116s_actual_joints.astype(
+                    np.float32
+                ),
+                "right_hand_dh116s_actual_joints": right_hand_dh116s_actual_joints.astype(
+                    np.float32
+                ),
                 "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
                 "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
             }
+            timing["numpy_message_build_ms"] = _elapsed_ms(stage_started)
 
-            if self.hand_mode in FOURIER_HAND_MODES:
-                numpy_data["left_hand_fourier_joints"] = left_hand_fourier_joints.astype(np.float32)
-                numpy_data["right_hand_fourier_joints"] = right_hand_fourier_joints.astype(np.float32)
-            elif self.hand_mode in DH116S_HAND_MODES:
-                numpy_data["left_hand_dh116s_joints"] = left_hand_dh116s_joints.astype(np.float32)
-                numpy_data["right_hand_dh116s_joints"] = right_hand_dh116s_joints.astype(np.float32)
-
+            stage_started = time.monotonic()
             packed_message = pack_pose_message(numpy_data, topic="pose")
+            timing["zmq_pack_ms"] = _elapsed_ms(stage_started)
+            timing["message_bytes"] = len(packed_message)
+            stage_started = time.monotonic()
             self.socket.send(packed_message)
-            if self.hand_mode in FOURIER_HAND_MODES:
-                self.socket.send(
-                    pack_pose_message(
-                        {
-                            "left_hand_fourier_actual_joints": (
-                                left_hand_fourier_actual_joints.astype(np.float32)
-                            ),
-                            "right_hand_fourier_actual_joints": (
-                                right_hand_fourier_actual_joints.astype(np.float32)
-                            ),
-                        },
-                        topic="fourier_state",
-                    )
+            timing["zmq_send_ms"] = _elapsed_ms(stage_started)
+            timing["sample_age_at_send_ms"] = max(
+                0.0,
+                (
+                    time.monotonic()
+                    - float(sample.get("timestamp_monotonic", time.monotonic()))
                 )
-            if self.hand_mode in DH116S_HAND_MODES:
-                self.socket.send(
-                    pack_pose_message(
-                        {
-                            "left_hand_dh116s_actual_joints": (
-                                left_hand_dh116s_actual_joints.astype(np.float32)
-                            ),
-                            "right_hand_dh116s_actual_joints": (
-                                right_hand_dh116s_actual_joints.astype(np.float32)
-                            ),
-                        },
-                        topic="dh116s_state",
-                    )
-                )
+                * 1000.0,
+            )
+            outcome = "sent"
 
             if self.record_dir:
+                stage_started = time.monotonic()
                 out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")
                 np.savez_compressed(out_path, **numpy_data)
                 self.record_idx += 1
+                timing["record_ms"] = _elapsed_ms(stage_started)
+            else:
+                timing["record_ms"] = 0.0
 
         self.step += 1
         self.next_target_ns += step_ns
@@ -2170,10 +1884,52 @@ class PoseStreamer:
             print(f"[{self.log_prefix}] FPS: {fps:.2f}, Step: {self.step}")
             self.fps_counter = 0
             self.last_fps_report = current_time
+        processing_finished = time.monotonic()
         elapsed = time.time() - self.frame_start
+        scheduled_sleep_ms = 0.0
         if elapsed < self.frame_time:
+            sleep_started = time.monotonic()
             time.sleep(self.frame_time - elapsed)
+            scheduled_sleep_ms = _elapsed_ms(sleep_started)
         self.frame_start = time.time()
+        self._finish_latency_row(
+            timing,
+            outcome,
+            loop_started,
+            processing_finished=processing_finished,
+            scheduled_sleep_ms=scheduled_sleep_ms,
+        )
+
+
+def _init_input_source(
+    input_source: str,
+    buffer_size: int,
+) -> "PicoReader | input_readers.IsaacTeleopReader":
+    """Create, start, and wait for readiness of the requested teleop input source."""
+    if input_source == "isaac-teleop":
+        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader.start()
+        print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
+        while reader.get_latest() is None:
+            print("waiting for Isaac Teleop body data (connect the headset to CloudXR)...")
+            time.sleep(1)
+        return reader
+
+    if xrt is None:
+        raise ImportError(
+            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
+        )
+
+    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    xrt.init()
+    print("Waiting for body tracking data...")
+    while not xrt.is_body_data_available():
+        print("waiting for body data...")
+        time.sleep(1)
+
+    reader = PicoReader(max_queue_size=buffer_size)
+    reader.start()
+    return reader
 
 
 def run_pico(
@@ -2188,29 +1944,34 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
-    hand_mode: str = "trigger",
-    fourier_coord_mode: str = "openxr_arm_frame",
-    fourier_debug: bool = False,
-    fourier_simulation_mode: bool = False,
+    input_source: str = "xrt",
+    hand_mode: str = HAND_MODE_TRIGGER,
     dh116s_debug: bool = False,
     dh116s_simulation_mode: bool = False,
-    dh116s_hand_dir: str = "left",
+    dh116s_hand_dir: str = "double",
     dh116s_node_id: int = 1,
-    dh116s_right_node_id: int = 9,
-    dh116s_current: int = 800,
+    dh116s_right_node_id: int = 1,
+    dh116s_left_device_index: int = 1,
+    dh116s_right_device_index: int = 0,
+    dh116s_current: int = 1000,
     dh116s_home_wait_time: float = 2.0,
+    dh116s_trigger_close_ratio: float = 0.5,
 ):
-    """Run Pico body tracking with real-time visualization and ZMQ streaming."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+    """Run body tracking with real-time visualization and ZMQ streaming."""
+    reader = _init_input_source(input_source, buffer_size)
+    dh116s_hand_driver = init_dh116s_hand_driver(
+        hand_mode=hand_mode,
+        dh116s_simulation_mode=dh116s_simulation_mode,
+        dh116s_hand_dir=dh116s_hand_dir,
+        dh116s_node_id=dh116s_node_id,
+        dh116s_right_node_id=dh116s_right_node_id,
+        dh116s_left_device_index=dh116s_left_device_index,
+        dh116s_right_device_index=dh116s_right_device_index,
+        dh116s_current=dh116s_current,
+        dh116s_home_wait_time=dh116s_home_wait_time,
+        dh116s_trigger_close_ratio=dh116s_trigger_close_ratio,
+        dh116s_debug=dh116s_debug,
+    )
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -2237,19 +1998,13 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            reader=reader,
             hand_mode=hand_mode,
-            fourier_coord_mode=fourier_coord_mode,
-            fourier_debug=fourier_debug,
-            fourier_simulation_mode=fourier_simulation_mode,
-            dh116s_debug=dh116s_debug,
-            dh116s_simulation_mode=dh116s_simulation_mode,
-            dh116s_hand_dir=dh116s_hand_dir,
-            dh116s_node_id=dh116s_node_id,
-            dh116s_right_node_id=dh116s_right_node_id,
-            dh116s_current=dh116s_current,
-            dh116s_home_wait_time=dh116s_home_wait_time,
+            dh116s_hand_driver=dh116s_hand_driver,
         )
     finally:
+        if dh116s_hand_driver is not None:
+            dh116s_hand_driver.close()
         socket.close()
         context.term()
         print("Threads stopped, ZMQ socket closed")
@@ -2326,23 +2081,12 @@ class PlannerStreamer:
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
-        hand_mode: str = "trigger",
-        fourier_coord_mode: str = "openxr_arm_frame",
-        fourier_debug: bool = False,
-        fourier_simulation_mode: bool = False,
-        fourier_hand_driver=None,
-        dh116s_debug: bool = False,
-        dh116s_simulation_mode: bool = False,
-        dh116s_hand_dir: str = "left",
-        dh116s_node_id: int = 1,
-        dh116s_right_node_id: int = 9,
-        dh116s_current: int = 800,
-        dh116s_home_wait_time: float = 2.0,
+        hand_mode: str = HAND_MODE_TRIGGER,
         dh116s_hand_driver=None,
     ):
         self.socket = socket
@@ -2351,6 +2095,8 @@ class PlannerStreamer:
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
+        self.hand_mode = hand_mode
+        self.dh116s_hand_driver = dh116s_hand_driver
 
         self.dt = 1.0 / max(1, poll_hz)
         # Current locomotion mode, default IDLE
@@ -2362,27 +2108,8 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        self.hand_mode = hand_mode
-        self.fourier_coord_mode = fourier_coord_mode
-        self.fourier_debug = FourierHandDebug(enabled=fourier_debug)
-        self.fourier_hand_driver = fourier_hand_driver or init_fourier_hand_driver(
-            hand_mode=hand_mode,
-            fourier_simulation_mode=fourier_simulation_mode,
-        )
-        self.dh116s_debug = DH116SHandDebug(enabled=dh116s_debug)
-        self.dh116s_hand_driver = dh116s_hand_driver or init_dh116s_hand_driver(
-            hand_mode=hand_mode,
-            dh116s_simulation_mode=dh116s_simulation_mode,
-            dh116s_hand_dir=dh116s_hand_dir,
-            dh116s_node_id=dh116s_node_id,
-            dh116s_right_node_id=dh116s_right_node_id,
-            dh116s_current=dh116s_current,
-            dh116s_home_wait_time=dh116s_home_wait_time,
-        )
-        if hand_mode == HAND_MODE_TRIGGER:
-            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
-        else:
-            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
+        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2416,13 +2143,13 @@ class PlannerStreamer:
         """Execute one iteration of the planner control loop."""
         try:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
-            xrt_timestamp = xrt.get_time_stamp_ns()
+            xrt_timestamp = self.reader.get_timestamp_ns()
             if xrt_timestamp == self.last_xrt_timestamp:
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
             # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
             ab_now = bool(a_pressed) and bool(b_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed)
             if ab_now and not self.prev_ab:
@@ -2435,7 +2162,7 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes()
+            lx, ly, rx, ry = get_controller_axes(self.reader)
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -2473,75 +2200,10 @@ class PlannerStreamer:
             upper_body_position = None
             left_hand_position = None
             right_hand_position = None
-            left_hand_fourier_position = None
-            right_hand_fourier_position = None
-            left_hand_fourier_actual_position = None
-            right_hand_fourier_actual_position = None
             left_hand_dh116s_position = None
             right_hand_dh116s_position = None
             left_hand_dh116s_actual_position = None
             right_hand_dh116s_actual_position = None
-            if self.hand_mode == HAND_MODE_FOURIER_TRIGGER:
-                (
-                    _left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    _left_grip,
-                    _right_grip,
-                ) = get_controller_inputs()
-                lh_fourier, rh_fourier = compute_fourier_hand_joints_from_triggers(
-                    self.fourier_hand_driver,
-                    left_trigger,
-                    right_trigger,
-                )
-                self.fourier_debug.maybe_log_trigger(
-                    left_trigger,
-                    right_trigger,
-                    lh_fourier,
-                    rh_fourier,
-                )
-                left_hand_fourier_position = lh_fourier.astype(np.float32).tolist()
-                right_hand_fourier_position = rh_fourier.astype(np.float32).tolist()
-                lh_fourier_actual, rh_fourier_actual = get_fourier_hand_actual_joints(
-                    self.fourier_hand_driver
-                )
-                left_hand_fourier_actual_position = (
-                    lh_fourier_actual.astype(np.float32).tolist()
-                )
-                right_hand_fourier_actual_position = (
-                    rh_fourier_actual.astype(np.float32).tolist()
-                )
-            elif self.hand_mode == HAND_MODE_DH116S_TRIGGER:
-                (
-                    _left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    _left_grip,
-                    _right_grip,
-                ) = get_controller_inputs()
-                lh_dh116s, rh_dh116s = compute_dh116s_hand_joints_from_triggers(
-                    self.dh116s_hand_driver,
-                    left_trigger,
-                    right_trigger,
-                )
-                self.dh116s_debug.maybe_log_trigger(
-                    left_trigger,
-                    right_trigger,
-                    lh_dh116s,
-                    rh_dh116s,
-                )
-                left_hand_dh116s_position = lh_dh116s.astype(np.float32).tolist()
-                right_hand_dh116s_position = rh_dh116s.astype(np.float32).tolist()
-                lh_dh116s_actual, rh_dh116s_actual = get_dh116s_hand_actual_joints(
-                    self.dh116s_hand_driver
-                )
-                left_hand_dh116s_actual_position = (
-                    lh_dh116s_actual.astype(np.float32).tolist()
-                )
-                right_hand_dh116s_actual_position = (
-                    rh_dh116s_actual.astype(np.float32).tolist()
-                )
-
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
                 left_hand_position = self.feedback_reader.left_hand_position_target
@@ -2558,127 +2220,59 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                if self.hand_mode == HAND_MODE_FOURIER_TRACKING:
-                    (
-                        lh_fourier,
-                        rh_fourier,
-                        left_landmarks,
-                        right_landmarks,
-                    ) = compute_fourier_hand_joints_from_tracking(
-                        self.fourier_hand_driver, self.fourier_coord_mode
+                # Compute hand joints from trigger/grip inputs so operator can
+                # control hand open/close while in VR 3PT mode
+                (
+                    left_menu_button,
+                    left_trigger,
+                    right_trigger,
+                    left_grip,
+                    right_grip,
+                ) = get_controller_inputs(self.reader)
+                lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                    self.left_hand_ik_solver,
+                    self.right_hand_ik_solver,
+                    left_trigger,
+                    left_grip,
+                    right_trigger,
+                    right_grip,
+                )
+                left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+                right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+                if self.hand_mode in DH116S_HAND_MODES:
+                    left_hand_position = None
+                    right_hand_position = None
+                    lh_dh116s, rh_dh116s = compute_dh116s_hand_joints_from_triggers(
+                        self.dh116s_hand_driver,
+                        left_trigger,
+                        right_trigger,
                     )
-                    self.fourier_debug.maybe_log(
-                        self.fourier_coord_mode,
-                        left_landmarks,
-                        right_landmarks,
-                        lh_fourier,
-                        rh_fourier,
-                    )
-                    left_hand_fourier_position = lh_fourier.astype(np.float32).tolist()
-                    right_hand_fourier_position = rh_fourier.astype(np.float32).tolist()
-                    lh_fourier_actual, rh_fourier_actual = get_fourier_hand_actual_joints(
-                        self.fourier_hand_driver
-                    )
-                    left_hand_fourier_actual_position = (
-                        lh_fourier_actual.astype(np.float32).tolist()
-                    )
-                    right_hand_fourier_actual_position = (
-                        rh_fourier_actual.astype(np.float32).tolist()
-                    )
-                elif self.hand_mode == HAND_MODE_DH116S_TRACKING:
-                    (
-                        lh_dh116s,
-                        rh_dh116s,
-                        left_landmarks,
-                        right_landmarks,
-                    ) = compute_dh116s_hand_joints_from_tracking(
-                        self.dh116s_hand_driver, self.fourier_coord_mode
-                    )
-                    self.dh116s_debug.maybe_log(
-                        self.fourier_coord_mode,
-                        left_landmarks,
-                        right_landmarks,
-                        lh_dh116s,
-                        rh_dh116s,
+                    lh_actual, rh_actual = get_dh116s_hand_actual_joints(
+                        self.dh116s_hand_driver
                     )
                     left_hand_dh116s_position = lh_dh116s.astype(np.float32).tolist()
                     right_hand_dh116s_position = rh_dh116s.astype(np.float32).tolist()
-                    lh_dh116s_actual, rh_dh116s_actual = get_dh116s_hand_actual_joints(
-                        self.dh116s_hand_driver
-                    )
-                    left_hand_dh116s_actual_position = (
-                        lh_dh116s_actual.astype(np.float32).tolist()
-                    )
-                    right_hand_dh116s_actual_position = (
-                        rh_dh116s_actual.astype(np.float32).tolist()
-                    )
-                elif self.hand_mode == HAND_MODE_TRIGGER:
-                    # Compute hand joints from trigger/grip inputs so operator can
-                    # control hand open/close while in VR 3PT mode
-                    (
-                        left_menu_button,
-                        left_trigger,
-                        right_trigger,
-                        left_grip,
-                        right_grip,
-                    ) = get_controller_inputs()
-                    lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                        self.left_hand_ik_solver,
-                        self.right_hand_ik_solver,
-                        left_trigger,
-                        left_grip,
-                        right_trigger,
-                        right_grip,
-                    )
-                    left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
-                    right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+                    left_hand_dh116s_actual_position = lh_actual.astype(np.float32).tolist()
+                    right_hand_dh116s_actual_position = rh_actual.astype(np.float32).tolist()
 
-            msg = build_planner_message_compat(
-                mode=mode_to_send.value,
-                movement=movement,
-                facing=facing,
+            msg = build_planner_message(
+                mode_to_send.value,
+                movement,
+                facing,
                 speed=speed,
                 height=-1.0,
                 upper_body_position=upper_body_position,
                 left_hand_position=left_hand_position,
                 right_hand_position=right_hand_position,
-                left_hand_fourier_position=left_hand_fourier_position,
-                right_hand_fourier_position=right_hand_fourier_position,
                 left_hand_dh116s_position=left_hand_dh116s_position,
                 right_hand_dh116s_position=right_hand_dh116s_position,
+                left_hand_dh116s_actual_position=left_hand_dh116s_actual_position,
+                right_hand_dh116s_actual_position=right_hand_dh116s_actual_position,
                 vr_3pt_position=vr_3pt_position,
                 vr_3pt_orientation=vr_3pt_orientation,
                 vr_3pt_compliance=vr_3pt_compliance,
             )
             self.socket.send(msg)
-            if left_hand_fourier_actual_position is not None:
-                self.socket.send(
-                    pack_pose_message(
-                        {
-                            "left_hand_fourier_actual_joints": np.asarray(
-                                left_hand_fourier_actual_position, dtype=np.float32
-                            ),
-                            "right_hand_fourier_actual_joints": np.asarray(
-                                right_hand_fourier_actual_position, dtype=np.float32
-                            ),
-                        },
-                        topic="fourier_state",
-                    )
-                )
-            if left_hand_dh116s_actual_position is not None:
-                self.socket.send(
-                    pack_pose_message(
-                        {
-                            "left_hand_dh116s_actual_joints": np.asarray(
-                                left_hand_dh116s_actual_position, dtype=np.float32
-                            ),
-                            "right_hand_dh116s_actual_joints": np.asarray(
-                                right_hand_dh116s_actual_position, dtype=np.float32
-                            ),
-                        },
-                        topic="dh116s_state",
-                    )
-                )
         except Exception as e:
             import traceback
 
@@ -2708,36 +2302,39 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
-    hand_mode: str = "trigger",
-    fourier_coord_mode: str = "openxr_arm_frame",
-    fourier_debug: bool = False,
-    fourier_simulation_mode: bool = False,
+    input_source: str = "xrt",
+    hand_mode: str = HAND_MODE_TRIGGER,
     dh116s_debug: bool = False,
     dh116s_simulation_mode: bool = False,
-    dh116s_hand_dir: str = "left",
+    dh116s_hand_dir: str = "double",
     dh116s_node_id: int = 1,
-    dh116s_right_node_id: int = 9,
-    dh116s_current: int = 800,
+    dh116s_right_node_id: int = 1,
+    dh116s_left_device_index: int = 1,
+    dh116s_right_device_index: int = 0,
+    dh116s_current: int = 1000,
     dh116s_home_wait_time: float = 2.0,
+    dh116s_trigger_close_ratio: float = 0.5,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
-      Keyboard a: Equivalent to A+B+X+Y
-      Keyboard b: Equivalent to A+X
     """
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+    reader = _init_input_source(input_source, buffer_size)
+    dh116s_hand_driver = init_dh116s_hand_driver(
+        hand_mode=hand_mode,
+        dh116s_simulation_mode=dh116s_simulation_mode,
+        dh116s_hand_dir=dh116s_hand_dir,
+        dh116s_node_id=dh116s_node_id,
+        dh116s_right_node_id=dh116s_right_node_id,
+        dh116s_left_device_index=dh116s_left_device_index,
+        dh116s_right_device_index=dh116s_right_device_index,
+        dh116s_current=dh116s_current,
+        dh116s_home_wait_time=dh116s_home_wait_time,
+        dh116s_trigger_close_ratio=dh116s_trigger_close_ratio,
+        dh116s_debug=dh116s_debug,
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2753,10 +2350,6 @@ def run_pico_manager(
     except Exception:
         pass
 
-    # Create shared reader and 3-point pose processor
-    reader = PicoReader(max_queue_size=buffer_size)
-    reader.start()
-
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
         with_g1_robot=with_g1_robot,
@@ -2764,37 +2357,6 @@ def run_pico_manager(
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
     )
-    keyboard_hotkeys = KeyboardHotkeyBridge()
-    fourier_hand_driver = init_fourier_hand_driver(
-        hand_mode=hand_mode,
-        fourier_simulation_mode=fourier_simulation_mode,
-    )
-    dh116s_hand_driver = init_dh116s_hand_driver(
-        hand_mode=hand_mode,
-        dh116s_simulation_mode=dh116s_simulation_mode,
-        dh116s_hand_dir=dh116s_hand_dir,
-        dh116s_node_id=dh116s_node_id,
-        dh116s_right_node_id=dh116s_right_node_id,
-        dh116s_current=dh116s_current,
-        dh116s_home_wait_time=dh116s_home_wait_time,
-    )
-    if hand_mode == HAND_MODE_FOURIER_TRACKING:
-        print(
-            f"[FourierHandDriver] coord_mode={fourier_coord_mode} "
-            "(recommended: openxr_arm_frame)"
-        )
-    elif hand_mode == HAND_MODE_FOURIER_TRIGGER:
-        print("[FourierHandDriver] trigger mode: Pico L/R triggers drive Fourier hands")
-    elif hand_mode == HAND_MODE_DH116S_TRACKING:
-        print(
-            f"[DH116SHandDriver] coord_mode={fourier_coord_mode} "
-            f"hand_dir={dh116s_hand_dir} left_node_id={dh116s_node_id} right_node_id={dh116s_right_node_id}"
-        )
-    elif hand_mode == HAND_MODE_DH116S_TRIGGER:
-        print(
-            f"[DH116SHandDriver] trigger mode: Pico triggers drive DH116S "
-            f"hand_dir={dh116s_hand_dir} left_node_id={dh116s_node_id} right_node_id={dh116s_right_node_id}"
-        )
 
     pose_streamer = PoseStreamer(
         socket=socket,
@@ -2805,20 +2367,9 @@ def run_pico_manager(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
-        hand_mode=hand_mode,
-        fourier_coord_mode=fourier_coord_mode,
-        fourier_debug=fourier_debug,
-        fourier_simulation_mode=fourier_simulation_mode,
-        fourier_hand_driver=fourier_hand_driver,
-        dh116s_debug=dh116s_debug,
-        dh116s_simulation_mode=dh116s_simulation_mode,
-        dh116s_hand_dir=dh116s_hand_dir,
-        dh116s_node_id=dh116s_node_id,
-        dh116s_right_node_id=dh116s_right_node_id,
-        dh116s_current=dh116s_current,
-        dh116s_home_wait_time=dh116s_home_wait_time,
-        dh116s_hand_driver=dh116s_hand_driver,
         log_prefix="PoseLoop",
+        hand_mode=hand_mode,
+        dh116s_hand_driver=dh116s_hand_driver,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2828,17 +2379,6 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
         hand_mode=hand_mode,
-        fourier_coord_mode=fourier_coord_mode,
-        fourier_debug=fourier_debug,
-        fourier_simulation_mode=fourier_simulation_mode,
-        fourier_hand_driver=fourier_hand_driver,
-        dh116s_debug=dh116s_debug,
-        dh116s_simulation_mode=dh116s_simulation_mode,
-        dh116s_hand_dir=dh116s_hand_dir,
-        dh116s_node_id=dh116s_node_id,
-        dh116s_right_node_id=dh116s_right_node_id,
-        dh116s_current=dh116s_current,
-        dh116s_home_wait_time=dh116s_home_wait_time,
         dh116s_hand_driver=dh116s_hand_driver,
     )
 
@@ -2857,9 +2397,7 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, B+Y=toggle frozen upper body, "
-          "left stick click=toggle VR3PT, left menu hold=pause pose, "
-          "A+B+X+Y=start/stop policy, keyboard a=start/stop policy, keyboard b=toggle mode")
+    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2873,26 +2411,24 @@ def run_pico_manager(
         prev_left_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
 
-            left_axis_click, _ = get_axis_clicks()
+            left_axis_click, _ = get_axis_clicks(reader)
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            keyboard_ax_pressed = keyboard_hotkeys.consume("b") if keyboard_hotkeys is not None else False
             ax_pressed = (a_pressed) and (x_pressed)
 
             # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
-            keyboard_start_combo = keyboard_hotkeys.consume("a") if keyboard_hotkeys is not None else False
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
@@ -2904,17 +2440,17 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
+                elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
+                elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
@@ -2923,7 +2459,7 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
@@ -2931,7 +2467,7 @@ def run_pico_manager(
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif not left_menu_button:
                     new_mode = StreamMode.POSE
@@ -2941,11 +2477,11 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if keyboard_start_combo or (start_combo and not prev_start_combo):
+                if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif keyboard_ax_pressed or (ax_pressed and not prev_ax_pressed):
+                elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
@@ -3006,9 +2542,17 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
-            # Mode-independent: send manager_state for data exporter
-            toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
-            toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
+            # Mode-independent: send manager_state for data exporter.
+            # Some PICO/XRoboToolkit builds expose the right controller face buttons
+            # inconsistently, so support both documented A/B and left-controller Y/X.
+            # B+Y is known to arrive on this PICO setup, so also let it toggle
+            # recording. This intentionally mirrors the operator workflow: B+Y
+            # enters/exits teleop and starts/stops the current episode.
+            toggle_dc_tmp = (
+                ((bool(a_pressed) or bool(y_pressed)) and left_grip_mgr > 0.5)
+                or by_pressed
+            )
+            toggle_da_tmp = (bool(b_pressed) or bool(x_pressed)) and left_grip_mgr > 0.5
             toggle_dc = toggle_dc_tmp and not prev_toggle_dc
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
@@ -3033,23 +2577,25 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        pose_streamer.close()
+        if dh116s_hand_driver is not None:
+            dh116s_hand_driver.close()
         reader.stop()
         three_point.close()
-        keyboard_hotkeys.close()
-        if fourier_hand_driver is not None:
-            close_fn = getattr(fourier_hand_driver, "close", None)
-            if callable(close_fn):
-                close_fn()
-        if dh116s_hand_driver is not None:
-            close_fn = getattr(dh116s_hand_driver, "close", None)
-            if callable(close_fn):
-                close_fn()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
 
 
 if __name__ == "__main__":
+
+    def _request_graceful_shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for _signal_name in ("SIGTERM", "SIGHUP"):
+        _signal_number = getattr(signal, _signal_name, None)
+        if _signal_number is not None:
+            signal.signal(_signal_number, _request_graceful_shutdown)
 
     import argparse
 
@@ -3074,63 +2620,6 @@ if __name__ == "__main__":
         type=str,
         default="npz",
         help="Recording format: 'npz' or 'bin' (default: npz)",
-    )
-    parser.add_argument(
-        "--hand_mode",
-        type=str,
-        choices=[
-            HAND_MODE_TRIGGER,
-            HAND_MODE_FOURIER_TRACKING,
-            HAND_MODE_FOURIER_TRIGGER,
-            HAND_MODE_DH116S_TRACKING,
-            HAND_MODE_DH116S_TRIGGER,
-        ],
-        default=HAND_MODE_TRIGGER,
-        help=(
-            "Hand control mode: legacy trigger/grip, Fourier tracking/trigger, "
-            "or DH116S tracking/trigger"
-        ),
-    )
-    parser.add_argument(
-        "--fourier_debug",
-        action="store_true",
-        help="Log periodic Fourier landmark distances and 6-DoF actions for debugging",
-    )
-    parser.add_argument(
-        "--fourier_sim",
-        action="store_true",
-        help="Run Fourier hand control in simulation mode without sending hardware SDK commands",
-    )
-    parser.add_argument(
-        "--dh116s_debug",
-        action="store_true",
-        help="Log periodic DH116S landmark distances and 6-DoF actions for debugging",
-    )
-    parser.add_argument(
-        "--dh116s_sim",
-        action="store_true",
-        help="Run DH116S hand control in simulation mode without sending hardware SDK commands",
-    )
-    parser.add_argument(
-        "--dh116s_hand_dir",
-        type=str,
-        choices=["left", "right", "double"],
-        default="left",
-        help="Physical DH116S hand side controlled by the connected CANFD device",
-    )
-    parser.add_argument("--dh116s_node_id", type=int, default=1, help="Left/single CANFD node ID for DH116S")
-    parser.add_argument("--dh116s_right_node_id", type=int, default=9, help="Right CANFD node ID for dual DH116S")
-    parser.add_argument(
-        "--dh116s_current",
-        type=int,
-        default=800,
-        help="DH116S max current in permille, 800=80%%",
-    )
-    parser.add_argument(
-        "--dh116s_home_wait_time",
-        type=float,
-        default=2.0,
-        help="Seconds to wait after DH116S homing",
     )
     parser.add_argument(
         "--manager",
@@ -3190,6 +2679,78 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--input-source",
+        type=str,
+        default="xrt",
+        choices=["xrt", "isaac-teleop"],
+        help=(
+            "Input source: 'xrt' for XRoboToolkit SDK (default), "
+            "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
+        ),
+    )
+    parser.add_argument(
+        "--hand_mode",
+        type=str,
+        default=HAND_MODE_TRIGGER,
+        choices=[HAND_MODE_TRIGGER, HAND_MODE_DH116S_TRACKING, HAND_MODE_DH116S_TRIGGER],
+        help="Hand mode: trigger (Dex3 default), dh116s, or dh116s_trigger",
+    )
+    parser.add_argument("--dh116s_debug", action="store_true", help="Print DH116S debug logs")
+    parser.add_argument(
+        "--dh116s_sim",
+        action="store_true",
+        help="Run DH116S driver in simulation mode without hardware I/O",
+    )
+    parser.add_argument(
+        "--dh116s_hand_dir",
+        type=str,
+        default="double",
+        choices=["left", "right", "double"],
+        help="Physical DH116S hand side",
+    )
+    parser.add_argument(
+        "--dh116s_node_id",
+        type=int,
+        default=1,
+        help="Left/single CANFD node ID for DH116S",
+    )
+    parser.add_argument(
+        "--dh116s_right_node_id",
+        type=int,
+        default=1,
+        help="Right CANFD node ID for dual DH116S",
+    )
+    parser.add_argument(
+        "--dh116s_left_device_index",
+        type=int,
+        default=1,
+        help="Left/single USB-CANFD device index for DH116S",
+    )
+    parser.add_argument(
+        "--dh116s_right_device_index",
+        type=int,
+        default=0,
+        help="Right USB-CANFD device index for DH116S",
+    )
+    parser.add_argument(
+        "--dh116s_current",
+        type=int,
+        default=1000,
+        help="DH116S max current passed to LHandPro SDK",
+    )
+    parser.add_argument(
+        "--dh116s_home_wait_time",
+        type=float,
+        default=2.0,
+        help="DH116S homing wait time passed to LHandPro SDK",
+    )
+    parser.add_argument(
+        "--dh116s_trigger_close_ratio",
+        type=float,
+        default=0.5,
+        help="Maximum trigger-controlled flexion ratio in [0.0, 1.0]",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -3230,16 +2791,18 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            input_source=args.input_source,
             hand_mode=args.hand_mode,
-            fourier_debug=args.fourier_debug,
-            fourier_simulation_mode=args.fourier_sim,
             dh116s_debug=args.dh116s_debug,
             dh116s_simulation_mode=args.dh116s_sim,
             dh116s_hand_dir=args.dh116s_hand_dir,
             dh116s_node_id=args.dh116s_node_id,
             dh116s_right_node_id=args.dh116s_right_node_id,
+            dh116s_left_device_index=args.dh116s_left_device_index,
+            dh116s_right_device_index=args.dh116s_right_device_index,
             dh116s_current=args.dh116s_current,
             dh116s_home_wait_time=args.dh116s_home_wait_time,
+            dh116s_trigger_close_ratio=args.dh116s_trigger_close_ratio,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -3255,14 +2818,16 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            input_source=args.input_source,
             hand_mode=args.hand_mode,
-            fourier_debug=args.fourier_debug,
-            fourier_simulation_mode=args.fourier_sim,
             dh116s_debug=args.dh116s_debug,
             dh116s_simulation_mode=args.dh116s_sim,
             dh116s_hand_dir=args.dh116s_hand_dir,
             dh116s_node_id=args.dh116s_node_id,
             dh116s_right_node_id=args.dh116s_right_node_id,
+            dh116s_left_device_index=args.dh116s_left_device_index,
+            dh116s_right_device_index=args.dh116s_right_device_index,
             dh116s_current=args.dh116s_current,
             dh116s_home_wait_time=args.dh116s_home_wait_time,
+            dh116s_trigger_close_ratio=args.dh116s_trigger_close_ratio,
         )

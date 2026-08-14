@@ -26,9 +26,9 @@ class AudioClient(Client):
 
     ## API Call ##
     def TtsMaker(self, text: str, speaker_id: int):
-        self.tts_index += self.tts_index
         p = {}
         p["index"] = self.tts_index
+        self.tts_index += 1
         p["text"] = text
         p["speaker_id"] = speaker_id
         parameter = json.dumps(p)
@@ -50,6 +50,24 @@ class AudioClient(Client):
         # p["name"] = 'volume'
         parameter = json.dumps(p)
         code, data = self._Call(ROBOT_API_ID_AUDIO_SET_VOLUME, parameter)
+        return code
+
+    def PlayStream(self, app_name: str, stream_id: str, pcm_data):
+        p = {}
+        p["app_name"] = app_name
+        p["stream_id"] = stream_id
+        parameter = json.dumps(p)
+        payload = list(pcm_data)
+        code, data = self._CallBinaryWithParameter(
+            ROBOT_API_ID_AUDIO_START_PLAY, parameter, payload
+        )
+        return code
+
+    def PlayStop(self, app_name: str):
+        p = {}
+        p["app_name"] = app_name
+        parameter = json.dumps(p)
+        code, data = self._Call(ROBOT_API_ID_AUDIO_STOP_PLAY, parameter)
         return code
 
     def LedControl(self, R: int, G: int, B: int):

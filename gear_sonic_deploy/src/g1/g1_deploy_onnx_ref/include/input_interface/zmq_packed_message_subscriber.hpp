@@ -6,11 +6,11 @@
  *
  * Each ZMQ message is a **single-part message** with the following layout:
  *
- *   [topic_prefix (optional)] [1280-byte JSON header] [concatenated binary fields]
+ *   [topic_prefix (optional)] [2048-byte JSON header] [concatenated binary fields]
  *
  * - **Topic prefix**: If a non-empty topic is configured, the subscriber
  *   filters on this prefix and strips it before processing.
- * - **JSON header** (exactly `HEADER_SIZE` = 1280 bytes, null-padded):
+ * - **JSON header** (exactly `HEADER_SIZE` = 2048 bytes, null-padded):
  *   Describes the binary payload – version, endianness, field names, dtypes,
  *   and shapes.  Example:
  *   ```json
@@ -96,7 +96,7 @@ inline T byte_swap(T value) {
 class ZMQPackedMessageSubscriber {
   public:
     /// Fixed size (in bytes) of the JSON header block at the start of each packed message.
-    static constexpr size_t HEADER_SIZE = 1280;
+    static constexpr size_t HEADER_SIZE = 2048;
 
     /**
      * @brief Construct a subscriber (does NOT connect or start yet).
@@ -159,7 +159,7 @@ class ZMQPackedMessageSubscriber {
       }
     };
 
-    /// Parsed representation of the 1280-byte JSON header.
+    /// Parsed representation of the 2048-byte JSON header.
     struct DecodedHeader {
       int version = 0;               ///< Protocol version (e.g. 1, 2, 3).
       std::string endian;            ///< "le" or "be" (empty defaults to "le").
@@ -189,20 +189,22 @@ class ZMQPackedMessageSubscriber {
       try {
         socket_ = std::make_unique<zmq::socket_t>(context_, zmq::socket_type::sub);
 
-        socket_->set(zmq::sockopt::rcvtimeo, timeout_ms_);
-        socket_->set(zmq::sockopt::linger, 0);
+        socket_->setsockopt(ZMQ_RCVTIMEO, &timeout_ms_, sizeof(timeout_ms_));
+        const int linger = 0;
+        socket_->setsockopt(ZMQ_LINGER, &linger, sizeof(linger));
         if (rcv_hwm_ > 0) {
-          socket_->set(zmq::sockopt::rcvhwm, rcv_hwm_);
+          socket_->setsockopt(ZMQ_RCVHWM, &rcv_hwm_, sizeof(rcv_hwm_));
         }
         if (conflate_) {
-          socket_->set(zmq::sockopt::conflate, 1);
+          const int conflate = 1;
+          socket_->setsockopt(ZMQ_CONFLATE, &conflate, sizeof(conflate));
         }
 
         const std::string endpoint = "tcp://" + host_ + ":" + std::to_string(port_);
         socket_->connect(endpoint);
         
         // Subscribe: if topic is empty, receive all; otherwise filter by topic prefix
-        socket_->set(zmq::sockopt::subscribe, topic_);
+        socket_->setsockopt(ZMQ_SUBSCRIBE, topic_.data(), topic_.size());
 
         if (verbose_) {
           std::cout << "[ZMQPackedMessageSubscriber] Subscribed to '" << topic_ << "' at "
@@ -436,4 +438,3 @@ class ZMQPackedMessageSubscriber {
 };
 
 #endif // ZMQ_PACKED_MESSAGE_SUBSCRIBER_HPP
-

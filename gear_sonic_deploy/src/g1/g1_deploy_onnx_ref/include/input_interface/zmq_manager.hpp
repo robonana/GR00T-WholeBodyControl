@@ -358,6 +358,10 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+
+        // Stop is terminal for this control tick. Do not fall through into the
+        // active mode handler, which can re-enable planner during shutdown.
+        return;
       }
 
       // Delegate based on current mode

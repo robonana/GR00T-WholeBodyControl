@@ -5,10 +5,10 @@ Starts the full data collection stack in a single tmux session:
 
     Window 0 — data_collection (4 panes):
     ┌───────────────────────┬───────────────────────┐
-    │ Pane 0: C++ Deploy    │ Pane 1: Data Exporter │
+    │ Pane 0: C++ Deploy    │ Pane 2: Data Exporter │
     │ (gear_sonic_deploy)   │ (.venv_data_collection)│
     ├───────────────────────┼───────────────────────┤
-    │ Pane 2: PICO Teleop   │ Pane 3: Camera Viewer │
+    │ Pane 1: Teleop        │ Pane 3: Camera Viewer │
     │ (.venv_teleop)        │ (.venv_data_collection)│
     └───────────────────────┴───────────────────────┘
 
@@ -20,56 +20,58 @@ Starts the full data collection stack in a single tmux session:
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
-    - Virtual environments set up:
-        bash install_scripts/install_pico.sh          -> .venv_teleop
+    - PICO virtual environment set up:
+        bash install_scripts/install_pico.sh -> .venv_teleop
+    - uv-managed data-collection environment set up:
         bash install_scripts/install_data_collection.sh -> .venv_data_collection
     - gear_sonic_deploy built (see docs)
     - For sim: .venv_sim must exist (see install instructions)
 
 Usage (from repo root — no venv activation needed):
-    python gear_sonic/scripts/launch_data_collection.py              # real robot (default)
-    python gear_sonic/scripts/launch_data_collection.py --sim        # MuJoCo sim
-    python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer  # skip viewer
-    python gear_sonic/scripts/launch_data_collection.py --pico-hand-mode fourier_trigger
-    python gear_sonic/scripts/launch_data_collection.py --pico-hand-mode dh116s_trigger --dh116s-hand-dir double
+    /usr/bin/python gear_sonic/scripts/launch_data_collection.py                          # real robot (default)
+    /usr/bin/python gear_sonic/scripts/launch_data_collection.py --sim                    # MuJoCo sim
+    /usr/bin/python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer       # skip viewer
+    /usr/bin/python gear_sonic/scripts/launch_data_collection.py --pico-input-source isaac-teleop
+    /usr/bin/python gear_sonic/scripts/launch_data_collection.py --pico-image-stream
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Literal
 import os
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from typing import Literal
 
 
-def _bootstrap_venv():
-    """Re-exec with the .venv_data_collection Python if tyro is not available."""
-    try:
-        import tyro  # noqa: F401
-        return
-    except ImportError:
-        pass
-
+def _bootstrap_uv_data_collection_env():
+    """Re-exec in the uv-managed data-collection environment."""
     repo_root = Path(__file__).resolve().parent.parent.parent
     venv_python = repo_root / ".venv_data_collection" / "bin" / "python"
-    if not venv_python.exists():
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    if not venv_python.is_file():
         print(
-            "ERROR: tyro is not installed and .venv_data_collection not found.\n"
+            "ERROR: uv data-collection environment not found.\n"
             "  Run: bash install_scripts/install_data_collection.sh"
         )
         sys.exit(1)
 
-    print(f"Re-launching with {venv_python} ...")
+    print(f"Re-launching with uv environment: {venv_python}")
     os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
 
-_bootstrap_venv()
+_bootstrap_uv_data_collection_env()
 
 import tyro
+
+
+DATA_COLLECTION_PYTHON = Path(".venv_data_collection/bin/python")
 
 
 def _get_local_ip() -> str:
@@ -99,6 +101,9 @@ class DataCollectionLaunchConfig:
     deploy_zmq_host: str = "localhost"
     """ZMQ host for the C++ deploy to listen on."""
 
+    state_zmq_port: int = 5557
+    """ZMQ state port published by C++ deploy and consumed by data exporter."""
+
     deploy_checkpoint: str = ""
     """Checkpoint path for deploy.sh (e.g., 'policy/checkpoints/my_model/model_step_100000').
     Leave empty to use the deploy.sh default."""
@@ -115,33 +120,45 @@ class DataCollectionLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
-    # PICO teleop options
+    # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
 
-    pico_hand_mode: Literal["trigger", "fourier", "fourier_trigger", "dh116s", "dh116s_trigger"] = "trigger"
-    """Hand mode forwarded to pico_manager_thread_server --hand_mode."""
+    pico_input_source: str = "xrt"
+    """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
 
-    dh116s_hand_dir: Literal["left", "right", "double"] = "left"
+    pico_hand_mode: Literal["trigger", "dh116s", "dh116s_trigger"] = "dh116s_trigger"
+    """Hand mode forwarded to pico_manager_thread_server.py --hand_mode."""
+
+    dh116s_hand_dir: Literal["left", "right", "double"] = "double"
     """Physical DH116S hand side forwarded to --dh116s_hand_dir."""
 
     dh116s_node_id: int = 1
-    """Left/single DH116S CANFD node ID forwarded to --dh116s_node_id."""
+    """Left/single DH116S CANFD node ID."""
 
-    dh116s_right_node_id: int = 9
-    """Right DH116S CANFD node ID forwarded to --dh116s_right_node_id."""
+    dh116s_right_node_id: int = 1
+    """Right DH116S CANFD node ID."""
 
-    dh116s_current: int = 800
-    """DH116S max current in permille forwarded to --dh116s_current."""
+    dh116s_left_device_index: int = 1
+    """Left/single DH116S USB-CANFD device index."""
+
+    dh116s_right_device_index: int = 0
+    """Right DH116S USB-CANFD device index."""
+
+    dh116s_current: int = 1000
+    """DH116S max current passed to LHandPro SDK."""
 
     dh116s_home_wait_time: float = 2.0
-    """Seconds to wait after DH116S homing forwarded to --dh116s_home_wait_time."""
+    """DH116S homing wait time passed to LHandPro SDK."""
+
+    dh116s_trigger_close_ratio: float = 0.6
+    """Maximum trigger-controlled flexion ratio, from 0.0 to 1.0."""
 
     dh116s_sim: bool = False
-    """Run DH116S hand control without sending hardware SDK commands."""
+    """Run DH116S sidecar in simulation mode without hardware I/O."""
 
     dh116s_debug: bool = False
-    """Log periodic DH116S hand control debug output."""
+    """Print DH116S debug logs from the teleop sidecar."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
@@ -159,14 +176,35 @@ class DataCollectionLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
+    data_root_output_dir: str = "outputs"
+    """Root directory used for collected LeRobot datasets."""
+
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
+
+    data_video_crf: int = 18
+    """H.264 CRF for saved dataset videos. Lower is clearer; 18 is visually near-lossless."""
+
+    data_video_preset: str = "veryfast"
+    """H.264 encoder preset used for saved dataset videos."""
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
     text_to_speech: bool = True
-    """Enable voice feedback via espeak (data exporter)."""
+    """Enable voice feedback from the data exporter."""
+
+    text_to_speech_backend: Literal["robot", "local", "both"] = "robot"
+    """Voice feedback backend for data exporter: robot speaker, local espeak, or both."""
+
+    robot_tts_network_interface: str = ""
+    """Robot DDS network interface for G1 speaker TTS. Empty = auto-detect 192.168.123.x."""
+
+    robot_tts_volume: int = 100
+    """Robot speaker volume for G1 AudioClient."""
+
+    robot_tts_speaker_id: int = 0
+    """Robot TTS speaker ID passed to G1 AudioClient.TtsMaker."""
 
     # Camera viewer
     camera_viewer: bool = True
@@ -178,16 +216,74 @@ class DataCollectionLaunchConfig:
     camera_port: int = 5555
     """Camera server port (shared by data exporter and viewer)."""
 
+    # PICO image streaming
+    pico_image_stream: bool = True
+    """Start an independent camera-to-PICO image streamer in a separate tmux window."""
+
+    pico_image_connection_mode: str = "connect"
+    """PICO image stream TCP direction: listen or connect."""
+
+    pico_image_pico_ip: str | None = None
+    """PICO headset IP when --pico-image-connection-mode connect is used."""
+
+    pico_image_pico_port: int = 12345
+    """PICO headset TCP port when --pico-image-connection-mode connect is used."""
+
+    pico_image_bind_host: str = "0.0.0.0"
+    """Local interface for the PICO image streamer to listen on."""
+
+    pico_image_port: int = 12345
+    """Local TCP port for PICO H.264 image streaming."""
+
+    pico_image_camera: str = "ego_view"
+    """Exact camera stream name to forward to PICO."""
+
+    pico_image_layout: Literal["ego", "ego_wrist_overlay"] = "ego_wrist_overlay"
+    """PICO image layout: head camera only, or head camera with wrist thumbnails."""
+
+    pico_image_wrist_crop_ratio: float = 0.15
+    """Fraction cropped from every wrist image edge before it is sent to PICO."""
+
+    pico_image_wrist_preview_width: int = 320
+    """Wrist preview width used only by the PICO streamer."""
+
+    pico_image_wrist_preview_height: int = 240
+    """Wrist preview height used only by the PICO streamer."""
+
+    pico_image_wrist_vertical_offset_ratio: float = -0.10
+    """Wrist-thumbnail vertical offset within each PICO eye; negative moves it upward."""
+
+    pico_image_vertical_offset_ratio: float = -0.10
+    """Head-view vertical offset within each PICO eye; negative moves it upward."""
+
+    pico_image_fps: int = 15
+    """Target PICO image streaming FPS."""
+
+    pico_image_bitrate_kbps: int = 3000
+    """PICO H.264 bitrate chosen to keep the head view clear."""
+
+    latency_monitoring: bool = True
+    """Write image and action latency CSV logs without changing transport behavior."""
+
+    latency_log_root: str = "logs/latency"
+    """Root for per-launch latency sessions; relative paths are resolved from the repo."""
+
+    tmux_history_limit: int = 5000
+    """Maximum scrollback lines per pane; bounds tmux memory use."""
+
 
 SESSION_NAME = "sonic_data_collection"
 
 
-def _check_prerequisites(sim: bool = False):
-    """Verify that required tools and venvs exist."""
+def _check_prerequisites(config: DataCollectionLaunchConfig):
+    """Verify that required tools and runtime environments exist."""
     errors = []
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
+
+    if config.tmux_history_limit < 0:
+        errors.append("tmux_history_limit must be zero or greater")
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -196,9 +292,9 @@ def _check_prerequisites(sim: bool = False):
             ".venv_teleop not found. Run: bash install_scripts/install_pico.sh"
         )
 
-    if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
+    if not (repo_root / DATA_COLLECTION_PYTHON).is_file():
         errors.append(
-            ".venv_data_collection not found. Run: "
+            ".venv_data_collection is missing. Run: "
             "bash install_scripts/install_data_collection.sh"
         )
 
@@ -209,11 +305,36 @@ def _check_prerequisites(sim: bool = False):
             "Ensure the deploy directory is set up."
         )
 
-    if sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
+    if config.pico_image_stream and not (
+        repo_root / "gear_sonic" / "scripts" / "run_pico_image_streamer.py"
+    ).exists():
+        errors.append("run_pico_image_streamer.py not found; PICO image streaming is unavailable")
+
+    if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
         errors.append(
             ".venv_sim not found. Set up the simulation venv first "
             "(see install instructions)."
         )
+
+    if config.pico_input_source not in {"xrt", "isaac-teleop"}:
+        errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
+
+    if config.pico_hand_mode not in {"trigger", "dh116s", "dh116s_trigger"}:
+        errors.append("--pico-hand-mode must be one of: trigger, dh116s, dh116s_trigger")
+    if not 0.0 <= config.dh116s_trigger_close_ratio <= 1.0:
+        errors.append("--dh116s-trigger-close-ratio must be in [0.0, 1.0]")
+    if not 0 <= config.data_video_crf <= 51:
+        errors.append("--data-video-crf must be in [0, 51]")
+
+    if config.pico_image_connection_mode not in {"listen", "connect"}:
+        errors.append("--pico-image-connection-mode must be one of: listen, connect")
+
+    if (
+        config.pico_image_stream
+        and config.pico_image_connection_mode == "connect"
+        and not config.pico_image_pico_ip
+    ):
+        errors.append("--pico-image-pico-ip is required when --pico-image-connection-mode connect")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -231,11 +352,29 @@ def _kill_existing_session():
     )
 
 
-def _create_tmux_session():
+def _create_tmux_session(history_limit: int):
     """Create a 4-pane tmux layout."""
     # Create detached session
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", SESSION_NAME],
+        check=True,
+    )
+
+    # Replacing the named session clears old pane history. Bound new
+    # scrollback so long-running camera/control logs cannot grow indefinitely.
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            SESSION_NAME,
+            "history-limit",
+            str(history_limit),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "set-option", "-t", SESSION_NAME, "remain-on-exit", "off"],
         check=True,
     )
 
@@ -299,11 +438,82 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
+def _shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _latency_env_prefix(latency_log_dir: Path | None) -> str:
+    if latency_log_dir is None:
+        return ""
+    return (
+        "export GEAR_SONIC_LATENCY_LOG_DIR="
+        f"{shlex.quote(str(latency_log_dir))} && "
+    )
+
+
+def _build_pico_image_stream_command(
+    repo_root: Path,
+    config: DataCollectionLaunchConfig,
+    latency_log_dir: Path | None = None,
+) -> str:
+    streamer_args = [
+        str(repo_root / DATA_COLLECTION_PYTHON),
+        "gear_sonic/scripts/run_pico_image_streamer.py",
+        "--camera-host",
+        config.camera_host,
+        "--camera-port",
+        str(config.camera_port),
+        "--camera-name",
+        config.pico_image_camera,
+        "--layout",
+        config.pico_image_layout,
+        "--wrist-crop-ratio",
+        str(config.pico_image_wrist_crop_ratio),
+        "--wrist-preview-width",
+        str(config.pico_image_wrist_preview_width),
+        "--wrist-preview-height",
+        str(config.pico_image_wrist_preview_height),
+        "--wrist-vertical-offset-ratio",
+        str(config.pico_image_wrist_vertical_offset_ratio),
+        "--vertical-offset-ratio",
+        str(config.pico_image_vertical_offset_ratio),
+        "--connection-mode",
+        config.pico_image_connection_mode,
+        "--pico-port",
+        str(config.pico_image_pico_port),
+        "--bind-host",
+        config.pico_image_bind_host,
+        "--bind-port",
+        str(config.pico_image_port),
+        "--fps",
+        str(config.pico_image_fps),
+        "--bitrate-kbps",
+        str(config.pico_image_bitrate_kbps),
+    ]
+    if config.pico_image_pico_ip:
+        streamer_args.extend(["--pico-ip", config.pico_image_pico_ip])
+
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        f"{_latency_env_prefix(latency_log_dir)}"
+        f"{_shell_join(streamer_args)}"
+    )
+
+
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    data_python = shlex.quote(str(repo_root / DATA_COLLECTION_PYTHON))
 
-    _check_prerequisites(sim=config.sim)
+    _check_prerequisites(config)
     _kill_existing_session()
+
+    latency_log_dir = None
+    if config.latency_monitoring:
+        latency_root = Path(config.latency_log_root).expanduser()
+        if not latency_root.is_absolute():
+            latency_root = repo_root / latency_root
+        latency_log_dir = latency_root / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        latency_log_dir.mkdir(parents=True, exist_ok=False)
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
@@ -311,28 +521,51 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
+    print(f"  Dataset root:    {config.data_root_output_dir}")
     print(f"  Deploy input:    {config.deploy_input_type}")
-    if config.deploy_checkpoint:
-        print(f"  Checkpoint:      {config.deploy_checkpoint}")
-    print(f"  Camera:          {config.camera_host}:{config.camera_port}")
-    print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
-    print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
-    print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
-    print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    print(f"  Teleop input:    {config.pico_input_source}")
     print(f"  PICO hand mode:  {config.pico_hand_mode}")
+    print(f"  State ZMQ port:  {config.state_zmq_port}")
     if config.pico_hand_mode.startswith("dh116s"):
         print(
             "  DH116S:          "
             f"hand_dir={config.dh116s_hand_dir} "
             f"left_node={config.dh116s_node_id} "
+            f"left_device={config.dh116s_left_device_index} "
             f"right_node={config.dh116s_right_node_id} "
+            f"right_device={config.dh116s_right_device_index} "
+            f"trigger_close={config.dh116s_trigger_close_ratio:.2f} "
             f"sim={config.dh116s_sim} debug={config.dh116s_debug}"
         )
-    print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
+    if config.deploy_checkpoint:
+        print(f"  Checkpoint:      {config.deploy_checkpoint}")
+    print(f"  Camera:          {config.camera_host}:{config.camera_port}")
+    print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
+    print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
+    print(
+        "  PICO image:      "
+        f"{'Yes' if config.pico_image_stream else 'No'}"
+        + (
+        f" ({config.pico_image_camera} -> {config.pico_image_connection_mode} "
+            f"{config.pico_image_pico_ip + ':' if config.pico_image_pico_ip else ''}"
+            f"{config.pico_image_pico_port if config.pico_image_connection_mode == 'connect' else config.pico_image_bind_host + ':' + str(config.pico_image_port)} "
+            f"@ {config.pico_image_fps}Hz)"
+            if config.pico_image_stream
+            else ""
+        )
+    )
+    print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    print(f"  Latency logs:    {latency_log_dir or 'Disabled'}")
+    print(
+        "  Text-to-speech:  "
+        f"{'Yes' if config.text_to_speech else 'No'}"
+        + (f" ({config.text_to_speech_backend})" if config.text_to_speech else "")
+    )
     print(f"  PC IP (for PICO): {_get_local_ip()}")
+    print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
 
-    _create_tmux_session()
+    _create_tmux_session(config.tmux_history_limit)
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
@@ -363,6 +596,7 @@ def main(config: DataCollectionLaunchConfig):
     deploy_mode = "sim" if config.sim else "real"
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
+        f"{_latency_env_prefix(latency_log_dir)}"
         f"./deploy.sh "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
@@ -377,6 +611,10 @@ def main(config: DataCollectionLaunchConfig):
         deploy_cmd += f"--motion-data {config.deploy_motion_data} "
     if config.deploy_output_type:
         deploy_cmd += f"--output-type {config.deploy_output_type} "
+    if config.state_zmq_port != 5557:
+        deploy_cmd += f"--zmq-out-port {config.state_zmq_port} "
+    if config.pico_hand_mode.startswith("dh116s"):
+        deploy_cmd += "--disable-hands "
     deploy_cmd += deploy_mode
 
     print("Starting C++ deploy (pane 0)...")
@@ -385,25 +623,57 @@ def main(config: DataCollectionLaunchConfig):
     if not _check_pane_alive(0):
         print("WARNING: C++ deploy pane may have failed to start.")
 
-    # --- Pane 2 (bottom-left): PICO Teleop Streamer ---
+    # --- Optional independent PICO image streamer window ---
+    if config.pico_image_stream:
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "pico_image"],
+            check=True,
+        )
+        image_stream_cmd = _build_pico_image_stream_command(
+            repo_root, config, latency_log_dir
+        )
+        print("Starting PICO image streamer (window: pico_image)...")
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:pico_image", image_stream_cmd, "C-m"],
+        )
+        time.sleep(1.0)
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        )
+
+    # --- Pane 2 (bottom-left): Teleop Streamer ---
+    xrt_sdk_root = repo_root / "external_dependencies" / "XRoboToolkit-PC-Service-Pybind_X86_and_ARM64"
+    xrt_lib_dir = xrt_sdk_root / "lib" / ("aarch64" if os.uname().machine == "aarch64" else "")
+    xrt_library_env = ""
+    if xrt_lib_dir.exists():
+        xrt_library_env = (
+            f"export LD_LIBRARY_PATH={shlex.quote(str(xrt_lib_dir))}:${{LD_LIBRARY_PATH:-}} && "
+        )
+
     pico_cmd = (
         f"cd {repo_root} && "
+        f"{_latency_env_prefix(latency_log_dir)}"
+        f"{xrt_library_env}"
         f"source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/pico_manager_thread_server.py"
+        f"python gear_sonic/scripts/pico_manager_thread_server.py "
+        f"--input-source {config.pico_input_source} "
+        f"--hand_mode {config.pico_hand_mode}"
     )
-    if config.pico_manager:
-        pico_cmd += " --manager"
-    pico_cmd += f" --hand_mode {config.pico_hand_mode}"
     if config.pico_hand_mode.startswith("dh116s"):
         pico_cmd += f" --dh116s_hand_dir {config.dh116s_hand_dir}"
         pico_cmd += f" --dh116s_node_id {config.dh116s_node_id}"
         pico_cmd += f" --dh116s_right_node_id {config.dh116s_right_node_id}"
+        pico_cmd += f" --dh116s_left_device_index {config.dh116s_left_device_index}"
+        pico_cmd += f" --dh116s_right_device_index {config.dh116s_right_device_index}"
         pico_cmd += f" --dh116s_current {config.dh116s_current}"
         pico_cmd += f" --dh116s_home_wait_time {config.dh116s_home_wait_time}"
+        pico_cmd += f" --dh116s_trigger_close_ratio {config.dh116s_trigger_close_ratio}"
         if config.dh116s_sim:
             pico_cmd += " --dh116s_sim"
         if config.dh116s_debug:
             pico_cmd += " --dh116s_debug"
+    if config.pico_manager:
+        pico_cmd += " --manager"
     if config.pico_vis_vr3pt:
         pico_cmd += " --vis_vr3pt"
     if config.pico_vis_smpl:
@@ -411,15 +681,14 @@ def main(config: DataCollectionLaunchConfig):
     if config.pico_waist_tracking:
         pico_cmd += " --waist_tracking"
 
-    print("Starting PICO teleop streamer (pane 2)...")
+    print("Starting teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
     # --- Pane 3 (bottom-right): Camera Viewer ---
     if config.camera_viewer:
         viewer_cmd = (
             f"cd {repo_root} && "
-            f"source .venv_data_collection/bin/activate && "
-            f"python gear_sonic/scripts/run_camera_viewer.py "
+            f"{data_python} gear_sonic/scripts/run_camera_viewer.py "
             f"--camera-host {config.camera_host} "
             f"--camera-port {config.camera_port}"
         )
@@ -429,17 +698,30 @@ def main(config: DataCollectionLaunchConfig):
     # --- Pane 1 (top-right): Data Exporter ---
     exporter_cmd = (
         f"cd {repo_root} && "
-        f"source .venv_data_collection/bin/activate && "
-        f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
+        f"{data_python} gear_sonic/scripts/run_data_exporter.py "
+        f"--task-prompt {shlex.quote(config.task_prompt)} "
         f"--data-collection-frequency {config.data_exporter_frequency} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--state-zmq-port {config.state_zmq_port} "
+        f"--text-to-speech-backend {config.text_to_speech_backend} "
+        f"--robot-tts-volume {config.robot_tts_volume} "
+        f"--robot-tts-speaker-id {config.robot_tts_speaker_id} "
+        f"--video-crf {config.data_video_crf} "
+        f"--video-preset {shlex.quote(config.data_video_preset)}"
     )
     if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
+    exporter_cmd += (
+        f" --root-output-dir {shlex.quote(config.data_root_output_dir)}"
+    )
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.robot_tts_network_interface:
+        exporter_cmd += (
+            " --robot-tts-network-interface "
+            f"{shlex.quote(config.robot_tts_network_interface)}"
+        )
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 
@@ -456,14 +738,21 @@ def main(config: DataCollectionLaunchConfig):
     print("  All components launched!")
     print()
     print(f"  tmux session: {SESSION_NAME}")
+    if latency_log_dir is not None:
+        print(f"  latency logs: {latency_log_dir}")
     print()
     if config.sim:
         print("  Window 'sim':")
         print("    MuJoCo Simulator (.venv_sim)")
         print()
+    if config.pico_image_stream:
+        print("  Window 'pico_image':")
+        print("    PICO Image Streamer (.venv_data_collection, uv-managed)")
+        print("    Close: q/x then Enter or Ctrl+C in that window; Ctrl+b & closes the tmux window")
+        print()
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")
-    print("    Pane 1 (bottom-left):  PICO Teleop")
+    print("    Pane 1 (bottom-left):  Teleop Streamer")
     print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
     if config.camera_viewer:
         print("    Pane 3 (bottom-right): Camera Viewer")
@@ -475,6 +764,8 @@ def main(config: DataCollectionLaunchConfig):
     print("    Ctrl+b, arrow keys  - Switch between panes")
     if config.sim:
         print("    Ctrl+b, n / p       - Next / previous window")
+    if config.pico_image_stream:
+        print("    Ctrl+b, n / p       - Switch to/from pico_image window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")
     print("=" * 60)

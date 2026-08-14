@@ -20,8 +20,30 @@ fi
 # Detect system architecture for platform-specific setup
 ARCH=$(uname -m)
 
+if [ "$ARCH" = "aarch64" ]; then
+    if [ -z "${CC:-}" ] && command -v gcc-10 &> /dev/null; then
+        export CC=gcc-10
+        echo "✅ Using GCC 10 for C builds"
+    fi
+    if [ -z "${CXX:-}" ] && command -v g++-10 &> /dev/null; then
+        export CXX=g++-10
+        echo "✅ Using G++ 10 for C++20 builds"
+    fi
+fi
+
+if [ -z "${TensorRT_ROOT:-}" ] && [ -d "$HOME/TensorRT" ]; then
+    export TensorRT_ROOT="$HOME/TensorRT"
+    echo "✅ TensorRT_ROOT defaulted to: $TensorRT_ROOT"
+fi
+
+if [ -z "${onnxruntime_ROOT:-}" ] && [ -d "/home/unitree/syj/deploy/thirdparty/onnxruntime-linux-aarch64-1.22.0" ]; then
+    export onnxruntime_ROOT="/home/unitree/syj/deploy/thirdparty/onnxruntime-linux-aarch64-1.22.0"
+    echo "✅ onnxruntime_ROOT defaulted to: $onnxruntime_ROOT"
+fi
+
 # Set up ONNX Runtime environment - check multiple possible locations
 ONNX_RUNTIME_PATHS=(
+    "${onnxruntime_ROOT:-}"
     "/opt/onnxruntime"
     "/usr/local/onnxruntime" 
     "/usr/lib/onnxruntime"
@@ -31,8 +53,10 @@ ONNX_RUNTIME_PATHS=(
 
 ONNX_FOUND=false
 for path in "${ONNX_RUNTIME_PATHS[@]}"; do
-    if [ -d "$path" ]; then
-        export onnxruntime_DIR="$path/lib/cmake/onnxruntime"
+    if [ -n "$path" ] && [ -d "$path" ]; then
+        export onnxruntime_ROOT="$path"
+        export onnxruntime_DIR="$path"
+        export LD_LIBRARY_PATH="$path/lib:${LD_LIBRARY_PATH:-}"
         echo "✅ ONNX Runtime found at: $path"
         ONNX_FOUND=true
         break
@@ -112,9 +136,8 @@ echo "🔍 Detected: $DISTRO_ID on $ARCH, using library path: $SYSTEM_LIB_DIR"
 CMAKE_PATHS="$SYSTEM_LIB_DIR/cmake"
 
 # Add ONNX Runtime path if we found one
-if [ -n "$onnxruntime_DIR" ]; then
-    ONNX_BASE_PATH=$(dirname $(dirname $onnxruntime_DIR))  # Remove /lib/cmake/onnxruntime to get base path
-    CMAKE_PATHS="$ONNX_BASE_PATH:$CMAKE_PATHS"
+if [ -n "${onnxruntime_ROOT:-}" ]; then
+    CMAKE_PATHS="$onnxruntime_ROOT:$CMAKE_PATHS"
 fi
 
 export CMAKE_PREFIX_PATH="$CMAKE_PATHS:$CMAKE_PREFIX_PATH"
@@ -127,32 +150,37 @@ ROS2_FOUND=false
 ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
 ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
 
-for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
-    if [ "$ROS2_FOUND" = true ]; then
-        break
-    fi
-    
-    for distro in "${ROS2_DISTROS[@]}"; do
-        ros2_setup_file="$install_path/$distro/setup.bash"
-        if [ -f "$ros2_setup_file" ]; then
-            source "$ros2_setup_file"
-            export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-            # Remove problematic system library path that conflicts with system GLIBC
-            export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
-            echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
-            export HAS_ROS2=1
-            export ROS_LOCALHOST_ONLY=1
-            ROS2_FOUND=true
+if [ "${HAS_ROS2:-0}" = "1" ]; then
+    for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
+        if [ "$ROS2_FOUND" = true ]; then
             break
         fi
+        
+        for distro in "${ROS2_DISTROS[@]}"; do
+            ros2_setup_file="$install_path/$distro/setup.bash"
+            if [ -f "$ros2_setup_file" ]; then
+                source "$ros2_setup_file"
+                export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+                # Remove problematic system library path that conflicts with system GLIBC
+                export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
+                echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
+                export HAS_ROS2=1
+                export ROS_LOCALHOST_ONLY=1
+                ROS2_FOUND=true
+                break
+            fi
+        done
     done
-done
 
-if [ "$ROS2_FOUND" = false ]; then
-    echo "⚠️  ROS2 not found in common locations:"
-    printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
-    echo "   Install ROS2 system-wide for ROS2InputHandler support"
-    echo "   Building will continue without ROS2InputHandler"
+    if [ "$ROS2_FOUND" = false ]; then
+        echo "⚠️  ROS2 requested but not found in common locations:"
+        printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
+        echo "   Install ROS2 system-wide for ROS2InputHandler support"
+        echo "   Building will continue without ROS2InputHandler"
+        export HAS_ROS2=0
+    fi
+else
+    echo "ℹ️  ROS2 support disabled by default (set HAS_ROS2=1 before sourcing to enable)"
     export HAS_ROS2=0
 fi
 
@@ -164,7 +192,7 @@ fi
 
 # TensorRT Environment Setup
 # Check if TensorRT_ROOT is already set, if not try to load from .bashrc
-if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
+if [ -z "${TensorRT_ROOT:-}" ] && [ -f "$HOME/.bashrc" ]; then
     # Extract TensorRT_ROOT from .bashrc if it exists
     BASHRC_TENSORRT=$(grep -o 'export TensorRT_ROOT=.*' "$HOME/.bashrc" | head -n1 | cut -d'=' -f2 | tr -d '"' | envsubst)
     if [ -n "$BASHRC_TENSORRT" ]; then
@@ -173,8 +201,8 @@ if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     fi
 fi
 
-if [ -n "$TensorRT_ROOT" ]; then
-    export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:$LD_LIBRARY_PATH"
+if [ -n "${TensorRT_ROOT:-}" ]; then
+    export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:${LD_LIBRARY_PATH:-}"
     echo "✅ TensorRT environment configured"
     
     # For Jetson systems, ensure DLA libraries are accessible for runtime
@@ -191,7 +219,11 @@ if [ -n "$TensorRT_ROOT" ]; then
         
         # CRITICAL: Add DLA library path for runtime (this is why your executable can't run)
         export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"
-        echo "   📁 Added DLA library path to current session"
+        # Also add to LIBRARY_PATH so the build-time linker finds -lcudla here.
+        # GCC/ld doesn't search ldconfig paths for -l resolution by default; LIBRARY_PATH
+        # is the build-time analogue of LD_LIBRARY_PATH and feeds directly into -L search.
+        export LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:${LIBRARY_PATH:-}"
+        echo "   📁 Added DLA library path to current session (runtime + build-time)"
         
         # Make it persistent so you don't need to run setup_env.sh every time
         if ! grep -q "/usr/lib/aarch64-linux-gnu/nvidia" ~/.bashrc 2>/dev/null; then
@@ -344,4 +376,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-
