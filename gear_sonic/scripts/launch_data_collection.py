@@ -178,6 +178,22 @@ class DataCollectionLaunchConfig:
     camera_port: int = 5555
     """Camera server port (shared by data exporter and viewer)."""
 
+    camera_source: Literal["auto", "zed"] = "auto"
+    """Camera source. 'auto': sim render when --sim, else the external camera server
+    (official behavior). 'zed': run a Stereolabs ZED via composed_camera on
+    camera_port — use this for the sim-robot + real-ZED setup. Requires `pyzed`
+    installed in .venv_camera."""
+
+    zed_svo: str = ""
+    """Optional .svo/.svo2 file to replay through the ZED driver instead of live
+    capture (only when camera_source='zed')."""
+
+    dh116s_sim_hand: bool = False
+    """Mirror the live DH116S hand targets onto the simulated hands (cosmetic).
+    Starts dh116s_sim_hand_bridge.py, which republishes the retargeted joints onto
+    the sim's rt/dex3/cmd. Only meaningful with --sim and a dh116s hand mode; it
+    does not affect the recorded dataset (hands are captured from ZMQ regardless)."""
+
 
 SESSION_NAME = "sonic_data_collection"
 
@@ -340,13 +356,21 @@ def main(config: DataCollectionLaunchConfig):
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
         )
+        # With camera_source='zed' the ego-view comes from the ZED, so the sim
+        # does not need to render/publish images — just run the physics + bridge.
+        if config.camera_source == "zed":
+            sim_img_flags = ""
+        else:
+            sim_img_flags = (
+                f"--enable-image-publish --enable-offscreen "
+                f"--camera-port {config.camera_port} "
+            )
         sim_cmd = (
             f"cd {repo_root} && "
             f"source .venv_sim/bin/activate && "
             f"python gear_sonic/scripts/run_sim_loop.py "
-            f"--enable-image-publish --enable-offscreen "
-            f"--camera-port {config.camera_port}"
-        )
+            f"{sim_img_flags}"
+        ).rstrip()
         sim_target = f"{SESSION_NAME}:sim"
         subprocess.run(
             ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
@@ -355,6 +379,49 @@ def main(config: DataCollectionLaunchConfig):
         time.sleep(3.0)
 
         # Switch back to the data_collection window for the remaining panes
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        )
+
+    # --- Window (camera_source=zed): ZED camera server on camera_port ---
+    if config.camera_source == "zed":
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "camera"],
+        )
+        zed_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_camera/bin/activate && "
+            f"python -m gear_sonic.camera.composed_camera "
+            f"--ego-view-camera zed --port {config.camera_port}"
+        )
+        if config.zed_svo:
+            zed_cmd += f" --ego-view-device-id {config.zed_svo}"
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:camera", zed_cmd, "C-m"],
+        )
+        src = f"SVO {config.zed_svo}" if config.zed_svo else "live ZED"
+        print(f"Starting ZED camera server ({src}) on port {config.camera_port} (window: camera)...")
+        time.sleep(3.0)
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        )
+
+    # --- Window (dh116s_sim_hand): mirror live DH116S targets onto the sim hands ---
+    if config.dh116s_sim_hand:
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "handbridge"],
+        )
+        bridge_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_sim/bin/activate && "
+            f"python gear_sonic/scripts/dh116s_sim_hand_bridge.py "
+            f"--zmq-host {config.deploy_zmq_host} --zmq-port 5556"
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:handbridge", bridge_cmd, "C-m"],
+        )
+        print("Starting DH116S->sim hand bridge (window: handbridge)...")
+        time.sleep(1.0)
         subprocess.run(
             ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
         )

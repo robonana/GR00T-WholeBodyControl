@@ -57,6 +57,16 @@ source .venv_teleop/bin/activate
 echo "[INFO] Installing gear_sonic[teleop] …"
 uv pip install -e "gear_sonic[teleop]"
 
+# ── 4b. DH116S hand retargeting deps (for --hand_mode dh116s) ─────────────────
+# dex_retargeting is vendored under external_dependencies/dh116s_hand_teleop and
+# added to sys.path by the driver; here we install only its third-party runtime
+# deps. NOTE: do NOT list `pin` here — gear_sonic[teleop] already installs a
+# compatible pinocchio (2.7.0). Re-listing `pin` re-resolves and pulls an
+# incompatible pinocchio-4 / coal native stack that fails to load
+# (libboost_serialization.so.1.90.0 not found).
+echo "[INFO] Installing DH116S hand retargeting deps …"
+uv pip install nlopt trimesh pytransform3d anytree lxml six pyyaml
+
 # ── 5. Install xrobotoolkit_sdk (CMake-based, not a pip package) ──────────────
 echo "[INFO] Installing XRoboToolkit SDK …"
 # Install cmake + pybind11 into the venv so the CMake-based build can find them.

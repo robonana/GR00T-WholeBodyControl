@@ -1,4 +1,11 @@
- # Byte-compiled / optimized / DLL files
+ # Large / vendored deps and binaries (not tracked in git)
+external_dependencies/GMR/
+*.whl
+*.zip
+*.bak
+*.bak.*
+
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class

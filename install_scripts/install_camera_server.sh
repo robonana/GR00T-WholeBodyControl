@@ -60,6 +60,28 @@ source .venv_camera/bin/activate
 echo "[INFO] Installing gear_sonic[camera] …"
 uv pip install -e "gear_sonic[camera]"
 
+# ── 4b. Install the ZED Python API (pyzed) for --ego-view-camera zed ──────────
+# Uses the ZED SDK's get_python_api.py, which fetches the wheel matching THIS
+# venv's Python + the installed SDK version (no manual wheel selection). Needs
+# pip + requests inside the venv. Skipped (with a hint) if the SDK is absent.
+ZED_GET_PY="/usr/local/zed/get_python_api.py"
+if [ -f "$ZED_GET_PY" ]; then
+    echo "[INFO] Installing ZED Python API (pyzed) via $ZED_GET_PY …"
+    uv pip install pip requests
+    if ! python "$ZED_GET_PY"; then
+        echo "[WARN] pyzed install failed — install it manually before using"
+        echo "       --camera-source zed:  python $ZED_GET_PY"
+    fi
+else
+    echo "[INFO] ZED SDK not found at /usr/local/zed — skipping pyzed."
+    echo "       For --ego-view-camera zed, install the ZED SDK, then run:"
+    echo "         source .venv_camera/bin/activate && python /usr/local/zed/get_python_api.py"
+fi
+
+# get_python_api.py upgrades numpy as a side effect; restore gear_sonic's pin so
+# cv2/depthai and the rest of the camera stack stay on a consistent numpy.
+uv pip install "numpy==1.26.4"
+
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 echo "  Camera server venv setup complete!"

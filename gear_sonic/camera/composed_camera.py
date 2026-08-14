@@ -394,6 +394,17 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 config=usb_config, mount_position=mount_position, device_index=device_idx
             )
 
+        elif camera_type == "zed":
+            from gear_sonic.camera.drivers.zed import ZedSensor
+
+            # device_id doubles as an optional SVO/SVO2 path: a .svo/.svo2 path
+            # -> replay that recording; otherwise -> live ZED capture.
+            svo_path = (
+                device_id if device_id and device_id.endswith((".svo", ".svo2")) else None
+            )
+            print(f"Initializing ZED sensor (svo={svo_path or 'live'})")
+            return ZedSensor(mount_position=mount_position, svo_path=svo_path)
+
         else:
             raise ValueError(f"Unsupported camera type: {camera_type}")
 
